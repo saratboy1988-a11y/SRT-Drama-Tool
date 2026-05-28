@@ -1,0 +1,160 @@
+{
+    "Female Lead (តួរស្រី)": {
+        "voice": "km-KH-SreymomNeural",
+        "age": "Normal (ធម្មតា)",
+        "emotion": "Normal (ធម្មតា)",
+        "rate": 0,
+        "tts_pitch": 25,
+        "model": "Full_gril_sound2_e95_s5130.pth",
+        "index": "E:/AI/RVC_PRO/Retrieval-based-Voice-Conversion-WebUI/logs/Full_gril_sound2/added_IVF1110_Flat_nprobe_1_Full_gril_sound2_v2.index",
+        "pitch": 5,
+        "index_rate": 0.5999999999999999,
+        "protect": 0.33,
+        "rms": 0.1,
+        "filter": 3
+    },
+    "Male Lead (តួរប្រុស)": {
+        "model": "",
+        "index": "",
+        "pitch": 0,
+        "index_rate": 0.5999999999999999,
+        "protect": 0.33,
+        "rms": 0.1,
+        "filter": 3,
+        "rate": 0,
+        "tts_pitch": 25
+    },
+    "Supporting Female (តួររងស្រី)": {
+        "model": "Full_gril_sound2_e95_s5130.pth",
+        "index": "E:/AI/RVC_PRO/Retrieval-based-Voice-Conversion-WebUI/logs/Full_gril_sound2/added_IVF1110_Flat_nprobe_1_Full_gril_sound2_v2.index",
+        "pitch": 2,
+        "index_rate": 0.5999999999999999,
+        "protect": 0.33,
+        "rms": 0.1,
+        "filter": 3,
+        "rate": 0,
+        "tts_pitch": 0
+    },
+    "Supporting Male (តួររងប្រុស)": {
+        "model": "",
+        "index": "",
+        "pitch": 0,
+        "index_rate": 0.5999999999999999,
+        "protect": 0.33,
+        "rms": 0.1,
+        "filter": 3,
+        "rate": 0,
+        "tts_pitch": 0
+    },
+    "Villain Female (តួរក្បត់ស្រី)": {
+        "model": "Full_gril_sound2_e95_s5130.pth",
+        "index": "E:/AI/RVC_PRO/Retrieval-based-Voice-Conversion-WebUI/logs/Full_gril_sound2/added_IVF1110_Flat_nprobe_1_Full_gril_sound2_v2.index",
+        "pitch": 1,
+        "index_rate": 0.5999999999999999,
+        "protect": 0.33,
+        "rms": 0.1,
+        "filter": 3,
+        "rate": 0,
+        "tts_pitch": 10
+    },
+    "Villain Male (តួរក្បត់ប្រុស)": {
+        "model": "",
+        "index": "",
+        "pitch": 0,
+        "index_rate": 0.5999999999999999,
+        "protect": 0.33,
+        "rms": 0.1,
+        "filter": 3,
+        "rate": 0,
+        "tts_pitch": 10
+    },
+    "Old Female (តួរចាស់ស្រី)": {
+        "model": "Full_gril_sound2_e95_s5130.pth",
+        "index": "E:/AI/RVC_PRO/Retrieval-based-Voice-Conversion-WebUI/logs/Full_gril_sound2/added_IVF1110_Flat_nprobe_1_Full_gril_sound2_v2.index",
+        "pitch": -5,
+        "index_rate": 0.5999999999999999,
+        "protect": 0.33,
+        "rms": 0.1,
+        "filter": 3,
+        "rate": 0,
+        "tts_pitch": -20
+    },
+    "Old Male (តួរចាស់ប្រុស)": {
+        "model": "",
+        "index": "",
+        "pitch": 0,
+        "index_rate": 0.5999999999999999,
+        "protect": 0.33,
+        "rms": 0.1,
+        "filter": 3,
+        "rate": 0,
+        "tts_pitch": -20
+    },
+    "Young Girl (តួរក្មេងស្រី)": {
+        "model": "Full_gril_sound2_e95_s5130.pth",
+        "index": "E:/AI/RVC_PRO/Retrieval-based-Voice-Conversion-WebUI/logs/Full_gril_sound2/added_IVF1110_Flat_nprobe_1_Full_gril_sound2_v2.index",
+        "pitch": 10,
+        "index_rate": 0.5999999999999999,
+        "protect": 0.33,
+        "rms": 0.1,
+        "filter": 3,
+        "rate": 0,
+        "tts_pitch": 50
+    },
+    "Young Boy (តួរក្មេងប្រុស)": {
+        "model": "",
+        "index": "",
+        "pitch": 0,
+        "index_rate": 0.5999999999999999,
+        "protect": 0.33,
+        "rms": 0.1,
+        "filter": 3,
+        "rate": 0,
+        "tts_pitch": 100
+    },
+    "តួរស្រី": {
+        "voice": "km-KH-SreymomNeural",
+        "age": "Normal",
+        "emotion": "Normal",
+        "rate": 0,
+        "tts_pitch": 15,
+        "fade_in": 50,
+        "fade_out": 50
+    },
+    "តួរប្រុស": {
+        "rate": 0,
+        "tts_pitch": 15
+    },
+    "តួររងស្រី": {
+        "rate": 0,
+        "tts_pitch": -5
+    },
+    "តួររងប្រុស": {
+        "rate": 0,
+        "tts_pitch": -5
+    },
+    "តួរក្បត់ស្រី": {
+        "rate": 0,
+        "tts_pitch": 5
+    },
+    "តួរក្បត់ប្រុស": {
+        "rate": 0,
+        "tts_pitch": 5
+    },
+    "តួរចាស់ស្រី": {
+        "rate": 0,
+        "tts_pitch": -20
+    },
+    "តួរចាស់ប្រុស": {
+        "rate": 0,
+        "tts_pitch": -20
+    },
+    "តួរក្មេងស្រី": {
+        "rate": 0,
+        "tts_pitch": 50
+    },
+    "តួរក្មេងប្រុស": {
+        "rate": 0,
+        "tts_pitch": 50
+    }
+}

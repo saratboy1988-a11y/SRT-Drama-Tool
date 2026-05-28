@@ -1,0 +1,5 @@
+{
+  "ffmpeg_path": "D:\\RVC_Tools\\FFmpeg\\bin\\ffmpeg.exe",
+  "ffprobe_path": "D:\\RVC_Tools\\FFmpeg\\bin\\ffprobe.exe",
+  "ffmpeg_auto_detect": true
+}

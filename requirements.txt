@@ -1,0 +1,9 @@
+PyQt5
+PyQt5-sip
+edge-tts
+pydub
+pygame
+pillow
+torch
+torchvision
+torchaudio

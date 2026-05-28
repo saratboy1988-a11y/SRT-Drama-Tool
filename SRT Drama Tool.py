@@ -2958,8 +2958,9 @@ class MainWindow(QMainWindow):
             "software": 2,
             "autosave": 3,
             "config": 4,
-            "logs": 5,
-            "about": 6
+            "update": 5,
+            "logs": 6,
+            "about": 7
         }
         self._show_sidebar_page(page_key, self.menu_buttons, self.settings_stack, page_map)
 

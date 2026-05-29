@@ -1,6 +1,6 @@
 ﻿# -*- coding: utf-8 -*-
 """
-SRT Drama Tool v1.0.3
+SRT Drama Tool v1.0.4
 PART 1 - Core UI + Light Accent Theme
 Author: NOU SARAT
 """
@@ -118,11 +118,12 @@ def get_app_version():
         pass
     
     # Fallback to hardcoded version
-    return "1.0.3"
+    return "1.0.4"
 
 APP_VERSION = get_app_version()
 APP_NAME = "SRT Drama Tool"
 DEFAULT_UPDATE_URL = "https://github.com/saratboy1988-a11y/SRT-Drama-Tool/releases/latest"
+DEFAULT_UPDATE_API_URL = "https://api.github.com/repos/saratboy1988-a11y/SRT-Drama-Tool/releases/latest"
 DEFAULT_KHMER_FONT = "Noto Sans Khmer"
 KHMER_FONT_CHOICES = [
     "Noto Sans Khmer",
@@ -147,6 +148,21 @@ KHMER_FONT_CHOICES = [
     "Siemreap",
     "Suwannaphum",
 ]
+
+
+def _version_parts(version_text):
+    """Return comparable numeric version parts from values like v1.2.3-beta."""
+    numbers = re.findall(r"\d+", str(version_text or ""))
+    return [int(part) for part in numbers] if numbers else [0]
+
+
+def is_newer_version(latest_version, current_version):
+    latest_parts = _version_parts(latest_version)
+    current_parts = _version_parts(current_version)
+    length = max(len(latest_parts), len(current_parts))
+    latest_parts += [0] * (length - len(latest_parts))
+    current_parts += [0] * (length - len(current_parts))
+    return latest_parts > current_parts
 
 # =============================
 # Application Paths
@@ -880,6 +896,61 @@ class DownloadThread(QThread):
             self.progress_signal.emit(percent)
 
 
+class UpdateCheckThread(QThread):
+    finished_signal = pyqtSignal(dict)
+    error_signal = pyqtSignal(str)
+
+    def __init__(self, api_url, current_version, timeout=20):
+        super().__init__()
+        self.api_url = api_url
+        self.current_version = current_version
+        self.timeout = timeout
+
+    def run(self):
+        try:
+            request = urllib.request.Request(
+                self.api_url,
+                headers={
+                    "Accept": "application/vnd.github+json",
+                    "User-Agent": "SRT-Drama-Tool-Updater"
+                }
+            )
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+
+            latest_version = str(payload.get("tag_name") or payload.get("name") or "").strip()
+            latest_version = latest_version.lstrip("vV")
+            if not latest_version:
+                raise ValueError("Release version was not found.")
+
+            assets = payload.get("assets") or []
+            installer_asset = None
+            for asset in assets:
+                name = str(asset.get("name") or "")
+                url = str(asset.get("browser_download_url") or "")
+                lowered = name.lower()
+                if url and lowered.endswith(".exe") and any(token in lowered for token in ["setup", "installer", "install"]):
+                    installer_asset = asset
+                    break
+            if installer_asset is None:
+                for asset in assets:
+                    name = str(asset.get("name") or "")
+                    url = str(asset.get("browser_download_url") or "")
+                    if url and name.lower().endswith(".exe"):
+                        installer_asset = asset
+                        break
+
+            self.finished_signal.emit({
+                "latest_version": latest_version,
+                "has_update": is_newer_version(latest_version, self.current_version),
+                "installer_name": str(installer_asset.get("name") or "") if installer_asset else "",
+                "installer_url": str(installer_asset.get("browser_download_url") or "") if installer_asset else "",
+                "release_url": str(payload.get("html_url") or DEFAULT_UPDATE_URL),
+            })
+        except Exception as e:
+            self.error_signal.emit(str(e))
+
+
 class FFmpegInstallThread(QThread):
     """Thread for running FFmpeg installer in background without blocking UI"""
     log_signal = pyqtSignal(str)
@@ -1046,6 +1117,7 @@ class MainWindow(QMainWindow):
     export_finished_signal = pyqtSignal()
     stop_player_signal = pyqtSignal()
     video_converted_signal = pyqtSignal(str)
+    merge_finished_signal = pyqtSignal(dict)
 
     def __init__(self):
         super().__init__()
@@ -1134,6 +1206,7 @@ class MainWindow(QMainWindow):
         self.export_finished_signal.connect(self.on_export_finished) # type: ignore
         self.stop_player_signal.connect(self.force_stop_player)
         self.video_converted_signal.connect(self.on_video_converted)
+        self.merge_finished_signal.connect(self.on_merge_projects_finished)
         self.stop_event = threading.Event()
         self.last_generated_audio = None # ចងចាំ File អូឌីយ៉ូចុងក្រោយ
 
@@ -3853,7 +3926,7 @@ class MainWindow(QMainWindow):
         scroll = self._create_page_container("Update (ធ្វើបច្ចុប្បន្នភាព)", "⬆")
         layout = scroll._page_layout
 
-        update_group = QGroupBox("Update Settings")
+        update_group = QGroupBox("កម្មវិធី Update")
         update_layout = QFormLayout(update_group)
         update_layout.setSpacing(12)
 
@@ -3861,32 +3934,47 @@ class MainWindow(QMainWindow):
         lbl_current.setStyleSheet("font-size: 12pt; font-weight: bold; color: #28a745;")
         update_layout.addRow("Current Version:", lbl_current)
 
-        self.update_url_input = QLineEdit()
-        self.update_url_input.setPlaceholderText("https://github.com/your-name/SRT-Drama-Tool/releases/latest")
-        self.update_url_input.setText(str(self.app_settings.get("update_url", DEFAULT_UPDATE_URL)))
-        self.update_url_input.setStyleSheet("padding: 8px; border: 2px solid #3498db; border-radius: 5px;")
-        update_layout.addRow("Update URL:", self.update_url_input)
+        self.update_status_label = QLabel("ចុច Check Update ដើម្បីពិនិត្យកំណែថ្មី។")
+        self.update_status_label.setWordWrap(True)
+        self.update_status_label.setStyleSheet("""
+            QLabel {
+                color: #495057;
+                padding: 10px;
+                background-color: #f8f9fa;
+                border: 1px solid #dee2e6;
+                border-radius: 6px;
+            }
+        """)
+        update_layout.addRow("Status:", self.update_status_label)
+
+        self.update_progress = QProgressBar()
+        self.update_progress.setVisible(False)
+        self.update_progress.setRange(0, 100)
+        self.update_progress.setFormat("%p%")
+        self.update_progress.setFixedHeight(24)
+        update_layout.addRow("Download:", self.update_progress)
 
         btn_row = QHBoxLayout()
 
-        btn_save_url = QPushButton("💾 Save URL")
-        btn_save_url.setCursor(Qt.PointingHandCursor)  # type: ignore[attr-defined]
-        btn_save_url.setStyleSheet("""
+        self.btn_check_update = QPushButton("🔍 Check Update")
+        self.btn_check_update.setCursor(Qt.PointingHandCursor)  # type: ignore[attr-defined]
+        self.btn_check_update.setStyleSheet("""
             QPushButton {
-                background-color: #6c757d;
+                background-color: #0d6efd;
                 color: white;
                 padding: 10px 18px;
                 border-radius: 6px;
                 font-weight: bold;
             }
-            QPushButton:hover { background-color: #5a6268; }
+            QPushButton:hover { background-color: #0b5ed7; }
         """)
-        btn_save_url.clicked.connect(self.save_update_url)
-        btn_row.addWidget(btn_save_url)
+        self.btn_check_update.clicked.connect(self.check_for_updates)
+        btn_row.addWidget(self.btn_check_update)
 
-        btn_update = QPushButton("⬆ Check / Open Update")
-        btn_update.setCursor(Qt.PointingHandCursor)  # type: ignore[attr-defined]
-        btn_update.setStyleSheet("""
+        self.btn_install_update = QPushButton("⬇ Update")
+        self.btn_install_update.setCursor(Qt.PointingHandCursor)  # type: ignore[attr-defined]
+        self.btn_install_update.setEnabled(False)
+        self.btn_install_update.setStyleSheet("""
             QPushButton {
                 background-color: #28a745;
                 color: white;
@@ -3895,17 +3983,18 @@ class MainWindow(QMainWindow):
                 font-weight: bold;
             }
             QPushButton:hover { background-color: #218838; }
+            QPushButton:disabled { background-color: #adb5bd; }
         """)
-        btn_update.clicked.connect(self.open_update_page)
-        btn_row.addWidget(btn_update)
+        self.btn_install_update.clicked.connect(self.download_and_install_update)
+        btn_row.addWidget(self.btn_install_update)
         btn_row.addStretch()
         update_layout.addRow("Actions:", btn_row)
 
         layout.addWidget(update_group)
 
         desc = QLabel(
-            "ដាក់ GitHub Releases URL ឬ download page របស់កម្មវិធីនេះ។ "
-            "ពេលចុច update កម្មវិធីនឹងបើក browser ទៅទំព័រនោះ។"
+            "ប៊ូតុង Check Update នឹងពិនិត្យ GitHub Release ថ្មី។ "
+            "បើមាន version ថ្មី ប៊ូតុង Update នឹងអាចចុចបាន ហើយកម្មវិធីនឹងទាញយក installer មកបើកដំឡើង។"
         )
         desc.setStyleSheet("""
             QLabel {
@@ -3996,6 +4085,136 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self.log(f"✗ Could not save update URL: {e}")
             QMessageBox.critical(self, "Update Error", f"Could not save update URL:\n{e}")
+
+    def check_for_updates(self) -> None:
+        """Check GitHub Releases for a newer installer."""
+        if hasattr(self, 'update_check_thread') and self.update_check_thread.isRunning():  # type: ignore
+            QMessageBox.information(self, "Update", "កំពុងពិនិត្យ update រួចហើយ...")
+            return
+
+        self.available_update = None
+        if hasattr(self, 'btn_install_update'):
+            self.btn_install_update.setEnabled(False)
+        if hasattr(self, 'btn_check_update'):
+            self.btn_check_update.setEnabled(False)
+        if hasattr(self, 'update_status_label'):
+            self.update_status_label.setText("កំពុងពិនិត្យ update...")
+
+        self.log("🔍 Checking for updates...")
+        self.update_check_thread = UpdateCheckThread(DEFAULT_UPDATE_API_URL, APP_VERSION)  # type: ignore
+        self.update_check_thread.finished_signal.connect(self.on_update_check_finished)
+        self.update_check_thread.error_signal.connect(self.on_update_check_error)
+        self.update_check_thread.start()
+
+    def on_update_check_finished(self, info) -> None:
+        if hasattr(self, 'btn_check_update'):
+            self.btn_check_update.setEnabled(True)
+
+        latest_version = info.get("latest_version", "")
+        if not info.get("has_update"):
+            message = f"កម្មវិធីនេះជាកំណែចុងក្រោយហើយ។ Current: v{APP_VERSION}"
+            if latest_version:
+                message += f" | Latest: v{latest_version}"
+            if hasattr(self, 'update_status_label'):
+                self.update_status_label.setText(message)
+            self.log(f"✓ No update available. Current v{APP_VERSION}, latest v{latest_version or APP_VERSION}")
+            QMessageBox.information(self, "Update", message)
+            return
+
+        if not info.get("installer_url"):
+            message = (
+                f"មាន version ថ្មី v{latest_version} ប៉ុន្តែមិនឃើញ installer .exe ក្នុង GitHub Release ទេ។"
+            )
+            if hasattr(self, 'update_status_label'):
+                self.update_status_label.setText(message)
+            self.log(f"⚠️ Update v{latest_version} found, but no installer asset was found.")
+            QMessageBox.warning(self, "Update", message)
+            return
+
+        self.available_update = info
+        message = (
+            f"មាន version ថ្មី v{latest_version}។ "
+            f"ចុច Update ដើម្បីទាញយក {info.get('installer_name', 'installer')} ហើយបើកដំឡើង។"
+        )
+        if hasattr(self, 'update_status_label'):
+            self.update_status_label.setText(message)
+        if hasattr(self, 'btn_install_update'):
+            self.btn_install_update.setEnabled(True)
+        self.log(f"⬆ Update available: v{latest_version} ({info.get('installer_name')})")
+        QMessageBox.information(self, "Update Available", message)
+
+    def on_update_check_error(self, error) -> None:
+        if hasattr(self, 'btn_check_update'):
+            self.btn_check_update.setEnabled(True)
+        if hasattr(self, 'update_status_label'):
+            self.update_status_label.setText("ពិនិត្យ update មិនបាន។ សូមពិនិត្យ Internet ឬ GitHub Release។")
+        self.log(f"✗ Update check failed: {error}")
+        QMessageBox.warning(self, "Update Error", f"Could not check for updates:\n{error}")
+
+    def download_and_install_update(self) -> None:
+        """Download the latest installer and launch it."""
+        info = getattr(self, 'available_update', None)
+        if not info or not info.get("installer_url"):
+            QMessageBox.information(self, "Update", "សូមចុច Check Update មុនសិន។")
+            return
+
+        if hasattr(self, 'update_download_thread') and self.update_download_thread.isRunning():  # type: ignore
+            QMessageBox.information(self, "Update", "កំពុងទាញយក update រួចហើយ...")
+            return
+
+        download_dir = os.path.join(tempfile.gettempdir(), "SRTDramaToolUpdates")
+        os.makedirs(download_dir, exist_ok=True)
+        filename = os.path.basename(str(info.get("installer_name") or "SRT_Drama_Tool_Setup.exe"))
+        installer_path = os.path.join(download_dir, filename)
+
+        if hasattr(self, 'update_progress'):
+            self.update_progress.setVisible(True)
+            self.update_progress.setValue(0)
+        if hasattr(self, 'btn_install_update'):
+            self.btn_install_update.setEnabled(False)
+        if hasattr(self, 'btn_check_update'):
+            self.btn_check_update.setEnabled(False)
+        if hasattr(self, 'update_status_label'):
+            self.update_status_label.setText(f"កំពុងទាញយក v{info.get('latest_version')}...")
+
+        self.update_download_thread = DownloadThread(info.get("installer_url"), installer_path, timeout=60)  # type: ignore
+        self.update_download_thread.progress_signal.connect(self.update_progress.setValue)
+        self.update_download_thread.finished_signal.connect(self.on_update_download_finished)
+        self.update_download_thread.error_signal.connect(self.on_update_download_error)
+        self.update_download_thread.start()
+        self.log(f"⬇️ Downloading update installer: {filename}")
+
+    def on_update_download_finished(self, filename) -> None:
+        if hasattr(self, 'update_progress'):
+            self.update_progress.setValue(100)
+            self.update_progress.setVisible(False)
+        if hasattr(self, 'btn_check_update'):
+            self.btn_check_update.setEnabled(True)
+
+        self.log(f"✅ Update installer downloaded: {filename}")
+        if hasattr(self, 'update_status_label'):
+            self.update_status_label.setText("Download រួចរាល់។ កំពុងបើក installer...")
+
+        QMessageBox.information(
+            self,
+            "Update",
+            "✅ Download រួចរាល់!\n\nInstaller នឹងបើកឥឡូវនេះ។ "
+            "សូមបិទកម្មវិធីនេះ បើ installer ស្នើឲ្យបិទ។"
+        )
+        if not self.open_file_or_folder(filename):
+            QMessageBox.warning(self, "Update Error", f"Could not open installer:\n{filename}")
+
+    def on_update_download_error(self, error) -> None:
+        if hasattr(self, 'update_progress'):
+            self.update_progress.setVisible(False)
+        if hasattr(self, 'btn_check_update'):
+            self.btn_check_update.setEnabled(True)
+        if getattr(self, 'available_update', None) and hasattr(self, 'btn_install_update'):
+            self.btn_install_update.setEnabled(True)
+        if hasattr(self, 'update_status_label'):
+            self.update_status_label.setText("Download update មិនបាន។ សូមព្យាយាមម្ដងទៀត។")
+        self.log(f"✗ Update download failed: {error}")
+        QMessageBox.critical(self, "Update Error", f"Failed to download update:\n{error}")
 
     def open_update_page(self) -> None:
         """Open the configured update/download page in the default browser."""
@@ -5279,6 +5498,8 @@ except Exception:
         if hasattr(self, 'export_progress'): # type: ignore
             self.export_progress.setValue(100)
     def on_export_finished(self) -> None:
+        if getattr(self, "merge_in_progress", False):
+            return
         self.btn_export_mp4.setEnabled(True) # type: ignore
         self.export_progress.setValue(100)
         # Also update Home tab progress bar (they share the same export process)
@@ -7350,7 +7571,12 @@ except Exception:
 
         # Stop players to release file handles
         if hasattr(self, 'media_player'): # type: ignore
-            self.media_player.stop()
+            try:
+                self.media_player.stop()
+                self.media_player.setVideoOutput(None)
+                self.media_player.setMedia(QMediaContent())
+            except:
+                pass
 
         # Stop pygame audio
         if hasattr(self, 'pygame_audio_available') and self.pygame_audio_available:
@@ -7364,6 +7590,7 @@ except Exception:
         if hasattr(self, 'preview_player'):
             try:
                 self.preview_player.stop() # type: ignore
+                self.preview_player.setMedia(QMediaContent())
             except:
                 pass  # Player may already be deleted
 
@@ -7415,6 +7642,11 @@ except Exception:
             self.app_settings["saturation"] = self.sb_saturation.value()
 
         self.save_app_settings() # type: ignore
+        try:
+            QApplication.processEvents()
+            time.sleep(0.2)
+        except:
+            pass
         if a0: # type: ignore
             a0.accept()
 
@@ -7584,6 +7816,10 @@ except Exception:
 
     def merge_projects(self) -> None:
         """Merge multiple projects by exporting each to video first, then concatenating the videos.""" # type: ignore
+        if getattr(self, "merge_in_progress", False):
+            QMessageBox.information(self, "Merge Projects", "Merge is already running. Please wait.")
+            return
+
         last_dir = self.app_settings.get("last_project_dir", "")
         paths, _ = QFileDialog.getOpenFileNames(self, "Select Projects to Merge", last_dir, "RVC Project (*.json)")
 
@@ -7609,157 +7845,262 @@ except Exception:
                 QMessageBox.warning(self, "Error", f"Could not load project {project_path}:\n{e}")
                 return
 
-        def build_tts_segments(data: dict[str, Any]) -> list[dict[str, Any]]:
-            """Convert saved project segments into the richer shape expected by run_srt_thread."""
-            saved_role_configs = self.role_configs
-            project_role_configs = data.get("role_configs", get_default_role_configs())
-            project_settings = data.get("settings", {})
-            global_fade_in = project_settings.get("fade_in", 50)
-            global_fade_out = project_settings.get("fade_out", 50)
+        self.merge_in_progress = True
+        self.progress.setValue(0)
+        self.progress_text_signal.emit("Merging projects...")
+        self.log(f"🔗 Starting merge for {len(project_data)} projects...")
+        self.start_worker_thread(
+            target=self.merge_projects_worker,
+            args=(project_data, self.chk_gpu.isChecked(), self.get_ffmpeg())
+        )
 
-            try:
-                self.role_configs = project_role_configs
-                tts_segments = []
-                for seg in data.get("segments", []):
-                    role = seg.get("role", "")
-                    voice, rate_str, pitch_str = self.get_tts_params(role, 0)
-                    config = project_role_configs.get(role, {})
-                    role_fade_in = config.get("fade_in", -1)
-                    role_fade_out = config.get("fade_out", -1)
-                    tts_segments.append({
-                        "text": seg.get("text", ""),
-                        "voice": voice,
-                        "rate": rate_str,
-                        "pitch": pitch_str,
-                        "start": int(seg.get("start", 0)),
-                        "end": int(seg.get("end", 0)),
-                        "fade_in": role_fade_in if role_fade_in != -1 else global_fade_in,
-                        "fade_out": role_fade_out if role_fade_out != -1 else global_fade_out,
-                    })
-                return tts_segments
-            finally:
-                self.role_configs = saved_role_configs
+    def build_project_tts_segments(self, data: dict[str, Any]) -> list[dict[str, Any]]:
+        """Convert saved project segments into the richer shape expected by run_srt_thread."""
+        project_role_configs = data.get("role_configs", get_default_role_configs())
+        project_settings = data.get("settings", {})
+        global_fade_in = project_settings.get("fade_in", 50)
+        global_fade_out = project_settings.get("fade_out", 50)
 
-        # Export each project to temporary video
+        def role_tts_params(role: str) -> tuple[str, str, str]:
+            config = project_role_configs.get(role, {})
+            voice = config.get("voice")
+            if not voice:
+                voice = "km-KH-SreymomNeural" if ("Female" in role or "Girl" in role or "ស្រី" in role) else "km-KH-PisethNeural"
+
+            rate_val = int(config.get("rate", 0))
+            pitch_val = int(config.get("tts_pitch", 0))
+            age = str(config.get("age", ""))
+            emotion = str(config.get("emotion", ""))
+
+            if "Child" in age:
+                pitch_val += 25
+                rate_val += 10
+            elif "Teen" in age:
+                pitch_val += 10
+                rate_val += 5
+            elif "Elder" in age:
+                pitch_val -= 15
+                rate_val -= 10
+
+            if "Happy" in emotion:
+                pitch_val += 5
+                rate_val += 10
+            elif "Sad" in emotion:
+                pitch_val -= 5
+                rate_val -= 15
+            elif "Angry" in emotion:
+                rate_val += 5
+                pitch_val -= 5
+            elif "Excited" in emotion:
+                rate_val += 20
+                pitch_val += 5
+
+            return str(voice), f"{rate_val:+d}%", f"{pitch_val:+d}Hz"
+
+        tts_segments = []
+        for seg in data.get("segments", []):
+            role = seg.get("role", "")
+            voice, rate_str, pitch_str = role_tts_params(role)
+            config = project_role_configs.get(role, {})
+            role_fade_in = config.get("fade_in", -1)
+            role_fade_out = config.get("fade_out", -1)
+            tts_segments.append({
+                "text": seg.get("text", ""),
+                "voice": voice,
+                "rate": rate_str,
+                "pitch": pitch_str,
+                "start": int(seg.get("start", 0)),
+                "end": int(seg.get("end", 0)),
+                "fade_in": role_fade_in if role_fade_in != -1 else global_fade_in,
+                "fade_out": role_fade_out if role_fade_out != -1 else global_fade_out,
+            })
+        return tts_segments
+
+    def merge_projects_worker(self, project_data: list[tuple[dict[str, Any], str]], use_gpu: bool, ffmpeg_bin: str) -> None:
+        """Export each project and concatenate the temporary videos in a background thread."""
         temp_videos = []
         temp_audios = []
         exported_projects = []
-        for i, (data, video_path) in enumerate(project_data):
-            segments = build_tts_segments(data)
-            if not segments:
-                continue
+        error_msg = ""
+        try:
+            total_projects = max(1, len(project_data))
 
-            # Generate audio for this project's segments
-            temp_audio = os.path.join(tempfile.gettempdir(), f"temp_audio_{i}_{int(time.time())}.wav")
-            temp_audios.append(temp_audio)
-            try:
-                self.run_srt_thread(segments, self.get_ffmpeg(), temp_audio, quality_idx=0, auto_fit=True, fade_in=50, fade_out=50, emit_signal=False)
-            except Exception as e:
-                self.safe_log(f"Failed to generate audio for project {i+1}: {e}")
-                continue # type: ignore
+            for i, (data, video_path) in enumerate(project_data):
+                self.safe_log(f"🔊 Merge {i + 1}/{total_projects}: generating audio...")
+                self.progress_text_signal.emit(f"Merge {i + 1}/{total_projects}: audio")
+                self.progress_signal.emit(int(i / total_projects * 80))
 
-            if not os.path.exists(temp_audio):
-                self.safe_log(f"Failed to generate audio for project {i+1}: output file was not created")
-                continue
+                segments = self.build_project_tts_segments(data)
+                if not segments:
+                    self.safe_log(f"⚠️ Project {i + 1} has no segments. Skipping.")
+                    continue
 
-            # Export video for this project
-            temp_video = os.path.join(tempfile.gettempdir(), f"temp_video_{i}_{int(time.time())}.mp4")
-            # Use consistent settings for all exports to ensure concat compatibility
-            video_settings = {
-                'resolution': '1920x1080',
-                'crop_preset': 'Original',
-                'brightness': 0.0,
-                'contrast': 1.0,
-                'saturation': 1.0,
-                'crop': [0,0,0,0],
-                'use_gpu': self.chk_gpu.isChecked(),
-                'preset': 'veryfast',
-                'crf': 23,
-                'orig_vol': 0.5,  # 50% volume
-                'remove_vocals': False,
-                'preview': False,
-                'cut_enabled': False
-            }
-
-            try:
-                self.run_export_mp4_thread(video_path, temp_audio, temp_video, self.get_ffmpeg(), video_settings)
-            except Exception as e:
-                self.safe_log(f"Failed to export video for project {i+1}: {e}") # type: ignore
-                continue
-
-            if not os.path.exists(temp_video):
-                self.safe_log(f"Failed to export video for project {i+1}: output file was not created")
-                continue
-
-            temp_videos.append(temp_video)
-            exported_projects.append((data, temp_video))
-
-        if not temp_videos:
-            for temp_file in temp_audios:
+                timestamp = int(time.time() * 1000)
+                temp_audio = os.path.join(tempfile.gettempdir(), f"merge_audio_{i}_{timestamp}.wav")
+                temp_audios.append(temp_audio)
                 try:
-                    os.remove(temp_file)
-                except:
-                    pass
-            QMessageBox.warning(self, "Merge Projects", "No videos were successfully exported.")
-            return
+                    self.run_srt_thread(
+                        segments,
+                        ffmpeg_bin,
+                        temp_audio,
+                        quality_idx=0,
+                        auto_fit=True,
+                        fade_in=50,
+                        fade_out=50,
+                        auto_play=False,
+                        emit_signal=False
+                    )
+                except Exception as e:
+                    self.safe_log(f"Failed to generate audio for project {i + 1}: {e}")
+                    continue
 
-        # Concatenate the exported videos
-        merged_video_path = os.path.join(tempfile.gettempdir(), f"merged_projects_{int(time.time())}.mp4")
-        success, error_msg = self.concat_project_videos(temp_videos, merged_video_path)
+                if not os.path.exists(temp_audio):
+                    self.safe_log(f"Failed to generate audio for project {i + 1}: output file was not created")
+                    continue
 
-        if success and os.path.exists(merged_video_path):
-            self.load_video(merged_video_path, autoplay=False)
-            self.log(f"✅ Merged {len(paths)} projects into video: {merged_video_path}")
+                self.safe_log(f"🎬 Merge {i + 1}/{total_projects}: exporting video...")
+                self.progress_text_signal.emit(f"Merge {i + 1}/{total_projects}: video")
+                temp_video = os.path.join(tempfile.gettempdir(), f"merge_video_{i}_{timestamp}.mp4")
+                video_settings = {
+                    'resolution': '1920x1080',
+                    'crop_preset': 'Original',
+                    'brightness': 0.0,
+                    'contrast': 1.0,
+                    'saturation': 1.0,
+                    'crop': [0, 0, 0, 0],
+                    'use_gpu': use_gpu,
+                    'preset': 'veryfast',
+                    'crf': 23,
+                    'orig_vol': 0.5,
+                    'remove_vocals': False,
+                    'preview': False,
+                    'cut_enabled': False
+                }
 
-            # Now merge segments with time gaps
+                try:
+                    self.run_export_mp4_thread(video_path, temp_audio, temp_video, ffmpeg_bin, video_settings)
+                except Exception as e:
+                    self.safe_log(f"Failed to export video for project {i + 1}: {e}")
+                    continue
+
+                if not os.path.exists(temp_video):
+                    self.safe_log(f"Failed to export video for project {i + 1}: output file was not created")
+                    continue
+
+                temp_videos.append(temp_video)
+                exported_projects.append((data, temp_video))
+
+            if not temp_videos:
+                self.merge_finished_signal.emit({
+                    "success": False,
+                    "message": "No videos were successfully exported.",
+                    "cleanup": temp_videos + temp_audios,
+                })
+                return
+
+            self.safe_log("🔗 Concatenating exported project videos...")
+            self.progress_text_signal.emit("Concatenating merged video...")
+            self.progress_signal.emit(90)
+
+            merged_video_path = os.path.join(tempfile.gettempdir(), f"merged_projects_{int(time.time())}.mp4")
+            success, error_msg = self.concat_project_videos(temp_videos, merged_video_path)
+            if not success or not os.path.exists(merged_video_path):
+                self.merge_finished_signal.emit({
+                    "success": False,
+                    "message": "Video concatenation failed.",
+                    "error": error_msg,
+                    "cleanup": temp_videos + temp_audios,
+                })
+                return
+
             merged_segments = []
-            time_offset = 0 # type: ignore
+            time_offset = 0
             for data, temp_video in exported_projects:
                 segments = data.get("segments", [])
                 if segments:
                     for seg in segments:
-                        merged_seg = {
-                            "start": seg.get("start", 0) + time_offset,
-                            "end": seg.get("end", 0) + time_offset,
+                        merged_segments.append({
+                            "start": int(seg.get("start", 0)) + time_offset,
+                            "end": int(seg.get("end", 0)) + time_offset,
                             "role": seg.get("role", ""),
                             "text": seg.get("text", "")
-                        }
-                        merged_segments.append(merged_seg)
+                        })
                     video_duration = self.get_video_duration_ms(temp_video)
                     if video_duration <= 0:
-                        video_duration = max((seg.get("end", 0) for seg in segments), default=0)
+                        video_duration = max((int(seg.get("end", 0)) for seg in segments), default=0)
                     time_offset += video_duration
 
-            # Populate merged segments
-            self.segment_table.setRowCount(0)
-            self.segment_table.setRowCount(len(merged_segments))
-
+            merged_role_configs = {}
             for data, _ in exported_projects:
                 for role, config in data.get("role_configs", {}).items():
-                    if role not in self.role_configs:
-                        self.role_configs[role] = config
+                    if role not in merged_role_configs:
+                        merged_role_configs[role] = config
 
-            for seg in merged_segments:
-                role = seg.get("role", "")
-                if role and role not in self.roles:
-                    self.roles.append(role)
+            self.merge_finished_signal.emit({
+                "success": True,
+                "merged_video_path": merged_video_path,
+                "merged_segments": merged_segments,
+                "role_configs": merged_role_configs,
+                "exported_count": len(exported_projects),
+                "cleanup": temp_videos + temp_audios,
+            })
+        except Exception as e:
+            self.merge_finished_signal.emit({
+                "success": False,
+                "message": "Merge failed.",
+                "error": str(e),
+                "cleanup": temp_videos + temp_audios,
+            })
 
-            current_voice = self.voice_combo.currentText() # type: ignore
-            self._refresh_voice_combo(current_voice)
+    def on_merge_projects_finished(self, result: dict[str, Any]) -> None:
+        self.merge_in_progress = False
+        self.progress_signal.emit(100 if result.get("success") else 0)
+        self.progress_text_signal.emit("")
 
-            for i, seg in enumerate(merged_segments):
-                self.set_table_row(i, seg["start"], seg["end"], seg["role"], seg["text"])
-
-            QMessageBox.information(self, "Merge Projects", f"Successfully merged {len(paths)} projects.\nTotal segments: {len(merged_segments)}\nVideo: {merged_video_path}")
-        else:
-            QMessageBox.warning(self, "Merge Projects", "Video concatenation failed.")
-
-        # Cleanup temp files
-        for temp_file in temp_videos + temp_audios:
+        for temp_file in result.get("cleanup", []):
             try:
                 os.remove(temp_file)
             except:
                 pass
+
+        if not result.get("success"):
+            details = f"\n\n{result.get('error')}" if result.get("error") else ""
+            QMessageBox.warning(self, "Merge Projects", f"{result.get('message', 'Merge failed.')}{details}")
+            return
+
+        merged_video_path = result.get("merged_video_path", "")
+        merged_segments = result.get("merged_segments", [])
+        self.load_video(merged_video_path, autoplay=False)
+        self.current_project_path = None
+        self.current_srt_path = None
+        self.log(f"✅ Merged {result.get('exported_count', 0)} projects into video: {merged_video_path}")
+
+        self.segment_table.setRowCount(0)
+        self.segment_table.setRowCount(len(merged_segments))
+
+        for role, config in result.get("role_configs", {}).items():
+            if role not in self.role_configs:
+                self.role_configs[role] = config
+
+        for seg in merged_segments:
+            role = seg.get("role", "")
+            if role and role not in self.roles:
+                self.roles.append(role)
+
+        current_voice = self.voice_combo.currentText() # type: ignore
+        self._refresh_voice_combo(current_voice)
+
+        for i, seg in enumerate(merged_segments):
+            self.set_table_row(i, seg["start"], seg["end"], seg["role"], seg["text"])
+
+        QMessageBox.information(
+            self,
+            "Merge Projects",
+            f"Successfully merged {result.get('exported_count', 0)} projects.\n"
+            f"Total segments: {len(merged_segments)}\n"
+            f"Video: {merged_video_path}\n\n"
+            "This merged result is unsaved. Use Save Project As to keep it."
+        )
 
     def new_project(self, *_args) -> None:
         """Create a new project with confirmation dialog""" # type: ignore
@@ -8112,7 +8453,7 @@ if __name__ == "__main__":
             # This preserves important crash logs and warnings for debugging
             try:
                 # Write exit info to log file for debugging
-                log_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_exit.log")
+                log_file = get_config_path("app_exit.log")
                 with open(log_file, "a", encoding="utf-8") as f:
                     f.write(f"\n[{datetime.datetime.now()}] App exited with code: {exit_code}\n")
                 

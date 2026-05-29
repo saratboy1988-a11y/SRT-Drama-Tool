@@ -1,6 +1,6 @@
 ﻿# -*- coding: utf-8 -*-
 """
-SRT Drama Tool v1.0.4
+SRT Drama Tool v1.0.5
 PART 1 - Core UI + Light Accent Theme
 Author: NOU SARAT
 """
@@ -35,6 +35,7 @@ import hmac
 import base64
 import datetime
 import tempfile
+import ctypes
 import edge_tts # type: ignore
 from typing import cast, Union, Optional, Any, Callable
 from pydub import AudioSegment
@@ -118,12 +119,13 @@ def get_app_version():
         pass
     
     # Fallback to hardcoded version
-    return "1.0.4"
+    return "1.0.5"
 
 APP_VERSION = get_app_version()
 APP_NAME = "SRT Drama Tool"
 DEFAULT_UPDATE_URL = "https://github.com/saratboy1988-a11y/SRT-Drama-Tool/releases/latest"
 DEFAULT_UPDATE_API_URL = "https://api.github.com/repos/saratboy1988-a11y/SRT-Drama-Tool/releases/latest"
+APP_MUTEX_NAME = "Global\\SRTDramaToolSingleInstance"
 DEFAULT_KHMER_FONT = "Noto Sans Khmer"
 KHMER_FONT_CHOICES = [
     "Noto Sans Khmer",
@@ -163,6 +165,24 @@ def is_newer_version(latest_version, current_version):
     latest_parts += [0] * (length - len(latest_parts))
     current_parts += [0] * (length - len(current_parts))
     return latest_parts > current_parts
+
+
+def acquire_single_instance_lock() -> bool:
+    """Prevent multiple app windows/processes from being opened at the same time."""
+    if sys.platform != "win32":
+        return True
+
+    try:
+        kernel32 = ctypes.windll.kernel32
+        mutex = kernel32.CreateMutexW(None, False, APP_MUTEX_NAME)
+        if not mutex:
+            return True
+        if kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+            return False
+        globals()["_app_single_instance_mutex"] = mutex
+        return True
+    except Exception:
+        return True
 
 # =============================
 # Application Paths
@@ -8310,6 +8330,15 @@ if __name__ == "__main__":
     splash: Optional[QSplashScreen] = None
     original_stderr = sys.stderr
     try: # type: ignore
+        if not acquire_single_instance_lock():
+            app = QApplication(sys.argv)
+            QMessageBox.information(
+                None,
+                "SRT Drama Tool",
+                "SRT Drama Tool is already running.\n\nកម្មវិធីកំពុងបើករួចហើយ។"
+            )
+            sys.exit(0)
+
         app = QApplication(sys.argv)
         startup_font = get_startup_khmer_font()
         app.setFont(QFont(startup_font, 10))

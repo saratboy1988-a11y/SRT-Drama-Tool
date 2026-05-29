@@ -1,6 +1,6 @@
 ﻿# -*- coding: utf-8 -*-
 """
-SRT Drama Tool v1.0.7
+SRT Drama Tool v1.0.8
 PART 1 - Core UI + Light Accent Theme
 Author: NOU SARAT
 """
@@ -119,7 +119,7 @@ def get_app_version():
         pass
     
     # Fallback to hardcoded version
-    return "1.0.7"
+    return "1.0.8"
 
 APP_VERSION = get_app_version()
 APP_NAME = "SRT Drama Tool"

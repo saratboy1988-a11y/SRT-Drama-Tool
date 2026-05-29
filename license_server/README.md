@@ -12,6 +12,25 @@ $env:LICENSE_APP_TOKEN="change-this-public-app-token"
 python -m uvicorn license_api:app --host 0.0.0.0 --port 8000
 ```
 
+## Admin panel
+
+Open this URL in your browser:
+
+```text
+http://localhost:8000/admin
+```
+
+Enter the same value as `LICENSE_ADMIN_TOKEN`, then click `Save Token`.
+
+From the panel you can:
+
+- Create or update a license
+- Set status: `active`, `inactive`, `expired`, `blocked`
+- Set device limit
+- Set expiry date
+- View activated machines
+- Reset activated devices
+
 ## Configure the desktop app
 
 Create this file on the customer/admin PC:

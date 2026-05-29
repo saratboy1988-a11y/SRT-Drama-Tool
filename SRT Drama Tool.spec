@@ -9,6 +9,7 @@ datas = [
     ('version.txt', '.'),
     ('app_settings.json', '.'),
     ('requirements.txt', '.'),
+    ('license_server_config.json', '.'),
     ('install_ffmpeg.py', '.'),
     ('install_pytorch.py', '.'),
     ('verify_installation.py', '.'),

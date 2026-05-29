@@ -1,6 +1,6 @@
 ﻿# -*- coding: utf-8 -*-
 """
-SRT Drama Tool v1.0.8
+SRT Drama Tool v1.0.9
 PART 1 - Core UI + Light Accent Theme
 Author: NOU SARAT
 """
@@ -8,6 +8,7 @@ Author: NOU SARAT
 import sys
 import os
 import urllib.request
+import urllib.error
 import zipfile
 import shutil
 import platform
@@ -119,13 +120,16 @@ def get_app_version():
         pass
     
     # Fallback to hardcoded version
-    return "1.0.8"
+    return "1.0.9"
 
 APP_VERSION = get_app_version()
 APP_NAME = "SRT Drama Tool"
 DEFAULT_UPDATE_URL = "https://github.com/saratboy1988-a11y/SRT-Drama-Tool/releases/latest"
 DEFAULT_UPDATE_API_URL = "https://api.github.com/repos/saratboy1988-a11y/SRT-Drama-Tool/releases/latest"
 APP_MUTEX_NAME = "Global\\SRTDramaToolSingleInstance"
+ONLINE_LICENSE_CONFIG_FILE = "license_server_config.json"
+ONLINE_LICENSE_STORE_FILE = "online_license.json"
+ONLINE_LICENSE_GRACE_DAYS = 3
 DEFAULT_KHMER_FONT = "Noto Sans Khmer"
 KHMER_FONT_CHOICES = [
     "Noto Sans Khmer",
@@ -440,12 +444,164 @@ def verify_license_key(key, machine_id):
     except Exception as e:
         return False, f"Error: {e}"
 
+
+def load_online_license_config():
+    """Load online license API settings from app data first, then bundled config."""
+    default_config = {
+        "enabled": False,
+        "api_base_url": "",
+        "app_token": "",
+        "timeout_seconds": 15,
+    }
+    config_paths = [
+        get_config_path(ONLINE_LICENSE_CONFIG_FILE),
+        resource_path(ONLINE_LICENSE_CONFIG_FILE),
+    ]
+
+    for path in config_paths:
+        try:
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    merged = default_config.copy()
+                    merged.update(data)
+                    merged["api_base_url"] = str(merged.get("api_base_url", "")).rstrip("/")
+                    return merged
+        except Exception:
+            continue
+
+    return default_config
+
+
+def online_license_is_enabled(config=None):
+    config = config or load_online_license_config()
+    return bool(config.get("enabled") and config.get("api_base_url"))
+
+
+def _license_api_post(path, payload, config=None):
+    config = config or load_online_license_config()
+    base_url = str(config.get("api_base_url", "")).rstrip("/")
+    if not base_url:
+        return False, {"message": "License server is not configured."}
+
+    url = f"{base_url}{path}"
+    body = json.dumps(payload).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": f"{APP_NAME}/{APP_VERSION}",
+    }
+    app_token = str(config.get("app_token", "")).strip()
+    if app_token:
+        headers["Authorization"] = f"Bearer {app_token}"
+
+    request = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    timeout = int(config.get("timeout_seconds") or 15)
+
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            response_body = response.read().decode("utf-8")
+            return True, json.loads(response_body) if response_body else {}
+    except urllib.error.HTTPError as e:
+        try:
+            error_body = e.read().decode("utf-8")
+            data = json.loads(error_body) if error_body else {"message": str(e)}
+            if isinstance(data, dict) and isinstance(data.get("detail"), dict):
+                return False, data["detail"]
+            return False, data
+        except Exception:
+            return False, {"message": str(e)}
+    except Exception as e:
+        return False, {"message": str(e), "network_error": True}
+
+
+def save_online_license(data):
+    payload = dict(data)
+    payload["last_valid_at"] = datetime.datetime.now().isoformat()
+    with open(get_config_path(ONLINE_LICENSE_STORE_FILE), "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+
+
+def load_saved_online_license():
+    path = get_config_path(ONLINE_LICENSE_STORE_FILE)
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {}
+
+
+def activate_online_license(email, license_key, machine_id):
+    config = load_online_license_config()
+    if not online_license_is_enabled(config):
+        return False, "Online license server is not configured.", {}
+
+    ok, response = _license_api_post(
+        "/api/v1/licenses/activate",
+        {
+            "email": email,
+            "license_key": license_key,
+            "machine_id": machine_id,
+            "app_version": APP_VERSION,
+        },
+        config,
+    )
+    if ok and response.get("ok"):
+        save_online_license(response)
+        return True, response.get("message", "Activated"), response
+
+    return False, response.get("message", "Online activation failed."), response
+
+
+def validate_saved_online_license(machine_id):
+    config = load_online_license_config()
+    if not online_license_is_enabled(config):
+        return False, "Online license is disabled."
+
+    saved = load_saved_online_license()
+    token = str(saved.get("token", "")).strip()
+    if not token:
+        return False, "No online license token found."
+
+    ok, response = _license_api_post(
+        "/api/v1/licenses/check",
+        {
+            "token": token,
+            "machine_id": machine_id,
+            "app_version": APP_VERSION,
+        },
+        config,
+    )
+    if ok and response.get("ok"):
+        merged = saved.copy()
+        merged.update(response)
+        save_online_license(merged)
+        return True, response.get("message", "Online license valid.")
+
+    if response.get("network_error"):
+        try:
+            last_valid_at = saved.get("last_valid_at")
+            if last_valid_at:
+                last_dt = datetime.datetime.fromisoformat(last_valid_at)
+                days = (datetime.datetime.now() - last_dt).days
+                if days <= ONLINE_LICENSE_GRACE_DAYS:
+                    return True, f"Offline grace period active ({days}/{ONLINE_LICENSE_GRACE_DAYS} days)."
+        except Exception:
+            pass
+
+    return False, response.get("message", "Online license invalid.")
+
 class LicenseDialog(QDialog):
     def __init__(self, machine_id):
         super().__init__()
         self.setWindowTitle("Register License (ចុះឈ្មោះប្រើប្រាស់)")
-        self.resize(400, 380)
+        self.resize(460, 430)
         self.machine_id = machine_id
+        self.online_config = load_online_license_config()
         
         layout = QVBoxLayout(self)
         form = QFormLayout()
@@ -464,6 +620,18 @@ class LicenseDialog(QDialog):
         form.addRow("License Key (លេខកូដ):", self.txt_key)
         
         layout.addLayout(form)
+
+        if online_license_is_enabled(self.online_config):
+            status_text = "Online activation enabled (អាច Activate តាម Online)"
+            status_color = "#198754"
+        else:
+            status_text = "Online activation not configured; offline key still works."
+            status_color = "#b26a00"
+
+        self.lbl_online_status = QLabel(status_text)
+        self.lbl_online_status.setWordWrap(True)
+        self.lbl_online_status.setStyleSheet(f"color: {status_color}; font-weight: bold;")
+        layout.addWidget(self.lbl_online_status)
         
         # --- Add Developer Info ---
         dev_group = QGroupBox("Contact for License (ទំនាក់ទំនងដើម្បីទិញ License)")
@@ -491,7 +659,27 @@ class LicenseDialog(QDialog):
         
     def register(self):
         key = self.txt_key.text().strip()
-        valid, msg = verify_license_key(key, self.machine_id)
+        email = self.txt_email.text().strip()
+
+        if online_license_is_enabled(self.online_config):
+            if not email:
+                QMessageBox.warning(self, "Missing Email", "Please enter your email before online activation.")
+                return
+
+            valid, msg, _ = activate_online_license(email, key, self.machine_id)
+            if valid:
+                QMessageBox.information(self, "Success", "Online activation successful!\n(Activate Online ជោគជ័យ)")
+                self.accept()
+                return
+
+            fallback_valid, fallback_msg = verify_license_key(key, self.machine_id)
+            if not fallback_valid:
+                QMessageBox.warning(self, "Failed", f"Online activation failed:\n{msg}")
+                return
+
+            valid, msg = fallback_valid, fallback_msg
+        else:
+            valid, msg = verify_license_key(key, self.machine_id)
         
         if valid:
             try:
@@ -8401,7 +8589,11 @@ if __name__ == "__main__":
         license_file = get_config_path('license.key')
         is_registered = False
 
-        if os.path.exists(license_file):
+        online_valid, online_msg = validate_saved_online_license(machine_id)
+        if online_valid:
+            is_registered = True
+
+        if not is_registered and os.path.exists(license_file):
             with open(license_file, "r") as f:
                 saved_key = f.read().strip()
                 valid, _ = verify_license_key(saved_key, machine_id)

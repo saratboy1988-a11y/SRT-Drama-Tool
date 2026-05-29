@@ -1,0 +1,6 @@
+{
+  "enabled": false,
+  "api_base_url": "https://your-license-server.example.com",
+  "app_token": "change-this-public-app-token",
+  "timeout_seconds": 15
+}

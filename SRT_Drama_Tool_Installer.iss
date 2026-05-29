@@ -1,11 +1,11 @@
 ; ============================================================================
 ; Inno Setup Script for SRT Drama Tool
 ; Developer: Nou Sarat
-; Version: 1.0.6
+; Version: 1.0.7
 ; ============================================================================
 
 #define MyAppName "SRT Drama Tool"
-#define MyAppVersion "1.0.6"
+#define MyAppVersion "1.0.7"
 #define MyAppPublisher "Nou Sarat"
 #define MyAppURL "https://github.com/saratboy1988-a11y/SRT-Drama-Tool/releases/latest"
 #define MyAppExeName "SRT Drama Tool.exe"
@@ -21,11 +21,11 @@ AppPublisher={#MyAppPublisher}
 AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}
 AppUpdatesURL={#MyAppURL}
-VersionInfoVersion=1.0.6.0
+VersionInfoVersion=1.0.7.0
 VersionInfoCopyright=Copyright © 2024-2026 {#MyAppPublisher}
 VersionInfoDescription=Professional SRT Subtitle and Voice Tool with AI RVC
 VersionInfoProductName={#MyAppName}
-VersionInfoProductVersion=1.0.6
+VersionInfoProductVersion=1.0.7
 
 ; Installation Settings
 DefaultDirName={autopf}\{#MyAppName}

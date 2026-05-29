@@ -1,6 +1,6 @@
 ﻿# -*- coding: utf-8 -*-
 """
-SRT Drama Tool v1.0.6
+SRT Drama Tool v1.0.7
 PART 1 - Core UI + Light Accent Theme
 Author: NOU SARAT
 """
@@ -119,7 +119,7 @@ def get_app_version():
         pass
     
     # Fallback to hardcoded version
-    return "1.0.6"
+    return "1.0.7"
 
 APP_VERSION = get_app_version()
 APP_NAME = "SRT Drama Tool"
@@ -4182,10 +4182,20 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Update", "កំពុងទាញយក update រួចហើយ...")
             return
 
-        download_dir = os.path.join(tempfile.gettempdir(), "SRTDramaToolUpdates")
-        os.makedirs(download_dir, exist_ok=True)
+        download_dir = os.path.join(get_app_data_dir(), "updates")
+        try:
+            os.makedirs(download_dir, exist_ok=True)
+        except Exception as e:
+            QMessageBox.warning(self, "Update Error", f"Could not create update folder:\n{download_dir}\n\n{e}")
+            return
+
         filename = os.path.basename(str(info.get("installer_name") or "SRT_Drama_Tool_Setup.exe"))
+        stem, ext = os.path.splitext(filename)
+        if not ext:
+            ext = ".exe"
         installer_path = os.path.join(download_dir, filename)
+        if os.path.exists(installer_path):
+            installer_path = os.path.join(download_dir, f"{stem}_{int(time.time())}{ext}")
 
         if hasattr(self, 'update_progress'):
             self.update_progress.setVisible(True)
@@ -4202,7 +4212,7 @@ class MainWindow(QMainWindow):
         self.update_download_thread.finished_signal.connect(self.on_update_download_finished)
         self.update_download_thread.error_signal.connect(self.on_update_download_error)
         self.update_download_thread.start()
-        self.log(f"⬇️ Downloading update installer: {filename}")
+        self.log(f"⬇️ Downloading update installer: {os.path.basename(installer_path)}")
 
     def on_update_download_finished(self, filename) -> None:
         if hasattr(self, 'update_progress'):

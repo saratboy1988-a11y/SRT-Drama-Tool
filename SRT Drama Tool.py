@@ -1,6 +1,6 @@
 ﻿# -*- coding: utf-8 -*-
 """
-SRT Drama Tool v1.0.5
+SRT Drama Tool v1.0.6
 PART 1 - Core UI + Light Accent Theme
 Author: NOU SARAT
 """
@@ -119,7 +119,7 @@ def get_app_version():
         pass
     
     # Fallback to hardcoded version
-    return "1.0.5"
+    return "1.0.6"
 
 APP_VERSION = get_app_version()
 APP_NAME = "SRT Drama Tool"
@@ -977,10 +977,10 @@ class FFmpegInstallThread(QThread):
     progress_signal = pyqtSignal(int)  # For progress bar updates
     finished_signal = pyqtSignal(bool)  # True = success, False = failed
 
-    def __init__(self, script_path, python_exe):
+    def __init__(self, script_path, python_cmd):
         super().__init__()
         self.script_path = script_path
-        self.python_exe = python_exe
+        self.python_cmd = python_cmd
 
     def run(self):
         import re  # For parsing percentage numbers
@@ -993,7 +993,7 @@ class FFmpegInstallThread(QThread):
 
             # Start installer process
             installer_process: subprocess.Popen = subprocess.Popen(
-                [self.python_exe, self.script_path],
+                [*self.python_cmd, self.script_path],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -1062,10 +1062,10 @@ class PyTorchInstallThread(QThread):
     progress_signal = pyqtSignal(int)
     finished_signal = pyqtSignal(bool)
 
-    def __init__(self, script_path, python_exe):
+    def __init__(self, script_path, python_cmd):
         super().__init__()
         self.script_path = script_path
-        self.python_exe = python_exe
+        self.python_cmd = python_cmd
 
     def run(self):
         import re
@@ -1077,7 +1077,7 @@ class PyTorchInstallThread(QThread):
             self.log_signal.emit("→ Reading installer output...")
 
             installer_process: subprocess.Popen = subprocess.Popen(
-                [self.python_exe, self.script_path],
+                [*self.python_cmd, self.script_path],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -4753,8 +4753,15 @@ except Exception:
     print(json.dumps({"installed": False}))
 """
         try:
+            python_cmd = self._python_command()
+            if not python_cmd:
+                return {
+                    "text": "✗ Python not found",
+                    "color": "#dc3545"
+                }
+
             result = subprocess.run(
-                [sys.executable, "-c", status_code],
+                [*python_cmd, "-c", status_code],
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -4813,7 +4820,14 @@ except Exception:
                     self.log("⚠️ PyTorch installation is already in progress...")
                     return # type: ignore
 
-                self.pytorch_install_thread = PyTorchInstallThread(script_path, sys.executable)
+                python_cmd = self._python_command()
+                if not python_cmd:
+                    self.log("✗ Python 3.10+ is required to run the PyTorch installer.")
+                    self.pytorch_progress.setVisible(False)
+                    QMessageBox.warning(self, "Python Required", "Please install Python 3.10+ before running the PyTorch installer.")
+                    return
+
+                self.pytorch_install_thread = PyTorchInstallThread(script_path, python_cmd)
                 self.pytorch_install_thread.log_signal.connect(self.log)
                 self.pytorch_install_thread.progress_signal.connect(self.pytorch_progress.setValue)
                 self.pytorch_install_thread.progress_signal.connect(lambda value: self.pytorch_progress.setFormat(f"{value}%"))
@@ -4886,7 +4900,14 @@ except Exception:
                     return
 
                 # Start installer in background thread
-                self.ffmpeg_install_thread = FFmpegInstallThread(script_path, sys.executable)
+                python_cmd = self._python_command()
+                if not python_cmd:
+                    self.log("✗ Python 3.10+ is required to run the FFmpeg installer.")
+                    self.dl_progress.setVisible(False)
+                    QMessageBox.warning(self, "Python Required", "Please install Python 3.10+ before running the FFmpeg installer.")
+                    return
+
+                self.ffmpeg_install_thread = FFmpegInstallThread(script_path, python_cmd)
                 self.ffmpeg_install_thread.log_signal.connect(self.log)
                 self.ffmpeg_install_thread.progress_signal.connect(self.dl_progress.setValue)
                 self.ffmpeg_install_thread.progress_signal.connect(lambda value: self.dl_progress.setFormat(f"{value}%"))
@@ -5043,11 +5064,34 @@ except Exception:
             script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), script_name)
         return script_path
 
+    def _python_command(self) -> Optional[list[str]]:
+        """Return a real Python interpreter command, avoiding the packaged app EXE."""
+        if not getattr(sys, 'frozen', False):
+            return [sys.executable]
+
+        for exe_name in ("python.exe", "python3.exe", "python"):
+            exe_path = shutil.which(exe_name)
+            if exe_path:
+                return [exe_path]
+
+        py_launcher = shutil.which("py.exe") or shutil.which("py")
+        if py_launcher:
+            return [py_launcher, "-3"]
+
+        return None
+
     def _launch_python_script(self, script_name: str, success_message: str, missing_message: str) -> None:
         try:
             script_path = self._bundled_script_path(script_name)
             if os.path.exists(script_path):
-                subprocess.Popen([sys.executable, script_path]) # type: ignore
+                python_cmd = self._python_command()
+                if not python_cmd:
+                    message = "Python is required to run this helper script. Please install Python 3.10+ and try again."
+                    self.log(f"✗ {message}")
+                    QMessageBox.warning(self, "Python Required", message)
+                    return
+
+                subprocess.Popen([*python_cmd, script_path]) # type: ignore
                 self.log(success_message)
             else:
                 self.log(missing_message)
@@ -6474,6 +6518,7 @@ except Exception:
 
     # type: ignore
     def clear_cache_manual(self) -> None:
+        self.clear_cache()
         QMessageBox.information(self, "Success", "Cache and RAM cleared successfully!\n(សម្អាតរួចរាល់)")
 
     def run_srt_conversion(self) -> None:
@@ -7289,7 +7334,6 @@ except Exception:
                 # Read stderr line by line for real-time progress
                 while True:
                     line = process.stderr.readline()  # type: ignore[union-attr]
-                    line = process.stderr.readline()
                     if not line:
                         break
 
@@ -7546,10 +7590,8 @@ except Exception:
                 temp_path = self.current_project_path + ".autosave_tmp"
                 with open(temp_path, "w", encoding="utf-8") as f:
                     json.dump(data, f, indent=4, ensure_ascii=False)
-                # Replace original only after successful write
-                if os.path.exists(self.current_project_path):
-                    os.remove(self.current_project_path)
-                os.rename(temp_path, self.current_project_path)
+                # Replace original atomically after successful write.
+                os.replace(temp_path, self.current_project_path)
                 self.log(f"💾 Auto-Saved: {os.path.basename(self.current_project_path)}")
             except Exception as e:
                 self.log(f"⚠️ Auto-Save Failed: {e}")

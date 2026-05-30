@@ -1,6 +1,6 @@
 ﻿# -*- coding: utf-8 -*-
 """
-SRT Drama Tool v1.0.9
+SRT Drama Tool v1.0.10
 PART 1 - Core UI + Light Accent Theme
 Author: NOU SARAT
 """
@@ -120,7 +120,7 @@ def get_app_version():
         pass
     
     # Fallback to hardcoded version
-    return "1.0.9"
+    return "1.0.10"
 
 APP_VERSION = get_app_version()
 APP_NAME = "SRT Drama Tool"
@@ -3212,6 +3212,7 @@ class MainWindow(QMainWindow):
             ("📦", "software", "Required Software"),
             ("💾", "autosave", "Auto-Save"),
             ("⚙", "config", "Configuration"),
+            ("🔐", "license", "License"),
             ("⬆", "update", "Update"),
             ("📝", "logs", "Logs"),
             ("👨‍💻", "about", "About")
@@ -3222,6 +3223,7 @@ class MainWindow(QMainWindow):
             self._create_software_page(),
             self._create_autosave_page(),
             self._create_config_page(),
+            self._create_license_page(),
             self._create_update_page(),
             self._create_logs_page(),
             self._create_about_page(),
@@ -3239,9 +3241,10 @@ class MainWindow(QMainWindow):
             "software": 2,
             "autosave": 3,
             "config": 4,
-            "update": 5,
-            "logs": 6,
-            "about": 7
+            "license": 5,
+            "update": 6,
+            "logs": 7,
+            "about": 8
         }
         self._show_sidebar_page(page_key, self.menu_buttons, self.settings_stack, page_map)
 
@@ -4128,6 +4131,158 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.log_box)
 
         return widget # type: ignore
+
+    def _create_license_page(self):
+        """Create license registration page."""
+        scroll = self._create_page_container("License & Register (ចុះឈ្មោះ License)", "🔐")
+        layout = scroll._page_layout
+
+        license_group = QGroupBox("Register License")
+        form = QFormLayout(license_group)
+        form.setSpacing(14)
+
+        machine_id = get_machine_id()
+        self.license_machine_id = QLineEdit(machine_id)
+        self.license_machine_id.setReadOnly(True)
+        self.license_machine_id.setStyleSheet("padding: 8px; font-family: Consolas;")
+        form.addRow("Machine ID:", self.license_machine_id)
+
+        self.license_status_label = QLabel()
+        self.license_status_label.setWordWrap(True)
+        form.addRow("Status:", self.license_status_label)
+
+        config = load_online_license_config()
+        online_text = "Enabled" if online_license_is_enabled(config) else "Not configured"
+        self.license_server_label = QLabel(f"{online_text} - {config.get('api_base_url') or 'No server URL'}")
+        self.license_server_label.setWordWrap(True)
+        self.license_server_label.setStyleSheet("color: #6c757d;")
+        form.addRow("Online Server:", self.license_server_label)
+
+        buttons = QHBoxLayout()
+        btn_register = QPushButton("🔐 Register License")
+        btn_register.setFixedHeight(45)
+        btn_register.clicked.connect(self.open_license_registration)
+        btn_register.setCursor(Qt.PointingHandCursor)  # type: ignore[attr-defined]
+        btn_register.setStyleSheet("background-color: #28a745; color: white; font-weight: bold; border-radius: 6px;")
+        buttons.addWidget(btn_register)
+
+        btn_check = QPushButton("🔍 Check License")
+        btn_check.setFixedHeight(45)
+        btn_check.clicked.connect(self.check_license_status_clicked)
+        btn_check.setCursor(Qt.PointingHandCursor)  # type: ignore[attr-defined]
+        btn_check.setStyleSheet("background-color: #007bff; color: white; font-weight: bold; border-radius: 6px;")
+        buttons.addWidget(btn_check)
+
+        btn_copy = QPushButton("📋 Copy Machine ID")
+        btn_copy.setFixedHeight(45)
+        btn_copy.clicked.connect(self.copy_machine_id)
+        btn_copy.setCursor(Qt.PointingHandCursor)  # type: ignore[attr-defined]
+        btn_copy.setStyleSheet("background-color: #6c757d; color: white; font-weight: bold; border-radius: 6px;")
+        buttons.addWidget(btn_copy)
+
+        btn_remove = QPushButton("🗑 Remove Saved License")
+        btn_remove.setFixedHeight(45)
+        btn_remove.clicked.connect(self.remove_saved_license)
+        btn_remove.setCursor(Qt.PointingHandCursor)  # type: ignore[attr-defined]
+        btn_remove.setStyleSheet("background-color: #dc3545; color: white; font-weight: bold; border-radius: 6px;")
+        buttons.addWidget(btn_remove)
+        form.addRow(buttons)
+
+        layout.addWidget(license_group)
+
+        note = QLabel(
+            "Online Register ប្រើ email និង license key ពី admin panel។ "
+            "បើ server មិនទាន់ configure កម្មវិធីនៅតែអាចប្រើ offline license key ចាស់បាន។"
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("font-size: 10pt; color: #495057; padding: 15px; background-color: #e7f3ff; border-radius: 6px;")
+        layout.addWidget(note)
+        layout.addStretch()
+
+        self.refresh_license_page_status()
+        return scroll
+
+    def get_license_status_text(self):
+        machine_id = get_machine_id()
+        online_valid, online_msg = validate_saved_online_license(machine_id)
+        if online_valid:
+            saved = load_saved_online_license()
+            license_key = saved.get("license_key", "")
+            expires_at = saved.get("expires_at") or "Lifetime"
+            return True, f"Online license valid. Key: {license_key} | Expires: {expires_at}\n{online_msg}"
+
+        license_file = get_config_path("license.key")
+        if os.path.exists(license_file):
+            try:
+                with open(license_file, "r", encoding="utf-8") as f:
+                    saved_key = f.read().strip()
+                valid, msg = verify_license_key(saved_key, machine_id)
+                if valid:
+                    return True, "Offline license valid."
+                return False, f"Saved offline license invalid: {msg}"
+            except Exception as e:
+                return False, f"Could not read saved offline license: {e}"
+
+        return False, "No registered license found. Trial mode may still be active."
+
+    def refresh_license_page_status(self):
+        if not hasattr(self, "license_status_label"):
+            return
+        valid, text = self.get_license_status_text()
+        self.license_status_label.setText(text)
+        color = "#e7f6ed" if valid else "#fff4df"
+        border = "#28a745" if valid else "#ffc107"
+        self.license_status_label.setStyleSheet(
+            f"padding: 10px; background-color: {color}; border: 1px solid {border}; "
+            "border-radius: 6px; font-weight: bold;"
+        )
+
+    def open_license_registration(self):
+        dlg = LicenseDialog(get_machine_id())
+        if dlg.exec_() == QDialog.Accepted:
+            self.refresh_license_page_status()
+            self.log("✓ License registered")
+
+    def check_license_status_clicked(self):
+        self.refresh_license_page_status()
+        valid, text = self.get_license_status_text()
+        if valid:
+            QMessageBox.information(self, "License", text)
+        else:
+            QMessageBox.warning(self, "License", text)
+
+    def copy_machine_id(self):
+        QApplication.clipboard().setText(get_machine_id())
+        QMessageBox.information(self, "License", "Machine ID copied.")
+
+    def remove_saved_license(self):
+        reply = QMessageBox.question(
+            self,
+            "Remove License",
+            "Remove saved license from this computer?\n\nលុប License ដែលបានរក្សាទុកចេញពីម៉ាស៊ីននេះ?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        removed = False
+        for filename in ("license.key", ONLINE_LICENSE_STORE_FILE):
+            path = get_config_path(filename)
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+                    removed = True
+            except Exception as e:
+                QMessageBox.warning(self, "License", f"Could not remove {filename}:\n{e}")
+                return
+
+        self.refresh_license_page_status()
+        if removed:
+            self.log("✓ Saved license removed")
+            QMessageBox.information(self, "License", "Saved license removed.")
+        else:
+            QMessageBox.information(self, "License", "No saved license was found.")
 
     def _create_update_page(self):
         """Create Update page"""

@@ -1,11 +1,11 @@
 ; ============================================================================
 ; Inno Setup Script for SRT Drama Tool
 ; Developer: Nou Sarat
-; Version: 1.0.10
+; Version: 1.1.0
 ; ============================================================================
 
 #define MyAppName "SRT Drama Tool"
-#define MyAppVersion "1.0.10"
+#define MyAppVersion "1.1.0"
 #define MyAppPublisher "Nou Sarat"
 #define MyAppURL "https://github.com/saratboy1988-a11y/SRT-Drama-Tool/releases/latest"
 #define MyAppExeName "SRT Drama Tool.exe"
@@ -21,11 +21,11 @@ AppPublisher={#MyAppPublisher}
 AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}
 AppUpdatesURL={#MyAppURL}
-VersionInfoVersion=1.0.10.0
-VersionInfoCopyright=Copyright © 2024-2026 {#MyAppPublisher}
+VersionInfoVersion=1.1.0.0
+VersionInfoCopyright=Copyright (c) 2024-2026 {#MyAppPublisher}
 VersionInfoDescription=Professional SRT Subtitle and Voice Tool with AI RVC
 VersionInfoProductName={#MyAppName}
-VersionInfoProductVersion=1.0.10
+VersionInfoProductVersion=1.1.0
 
 ; Installation Settings
 DefaultDirName={autopf}\{#MyAppName}
@@ -53,8 +53,8 @@ ShowLanguageDialog=no
 
 ; Privileges and Architecture
 PrivilegesRequired=lowest
-ArchitecturesAllowed=x64
-ArchitecturesInstallIn64BitMode=x64
+ArchitecturesAllowed=x64compatible
+ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=6.1sp1
 
 ; Other Settings
@@ -73,7 +73,6 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
-Name: "quicklaunchicon"; Description: "{cm:CreateQuickLaunchIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked; OnlyBelowVersion: 6.1; Check: not IsAdminInstallMode
 
 [Files]
 ; Main Application (onedir build avoids PyInstaller _MEI temp extraction/DLL errors)
@@ -87,6 +86,9 @@ Source: "logo.ico"; DestDir: "{app}"; Flags: ignoreversion
 Source: "srt_drama_tool.png"; DestDir: "{app}"; Flags: ignoreversion
 
 ; Helper Scripts
+Source: "License Server Launcher.py"; DestDir: "{app}"; Flags: ignoreversion
+Source: "Run License Server.bat"; DestDir: "{app}"; Flags: ignoreversion
+Source: "license_server\*"; DestDir: "{app}\license_server"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "install_ffmpeg.py"; DestDir: "{app}"; Flags: ignoreversion
 Source: "install_pytorch.py"; DestDir: "{app}"; Flags: ignoreversion
 Source: "verify_installation.py"; DestDir: "{app}"; Flags: ignoreversion
@@ -99,14 +101,12 @@ Source: "*.md"; DestDir: "{app}\docs"; Flags: ignoreversion
 [Icons]
 ; Start Menu Icons
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
+Name: "{group}\Run License Server"; Filename: "{app}\Run License Server.bat"; WorkingDir: "{app}"
 Name: "{group}\{cm:UninstallProgram,{#MyAppName}}"; Filename: "{uninstallexe}"
 Name: "{group}\Documentation"; Filename: "{app}\docs"; Check: DirExists(ExpandConstant('{app}\docs'))
 
 ; Desktop Icon
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
-
-; Quick Launch Icon
-Name: "{userappdata}\Microsoft\Internet Explorer\Quick Launch\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: quicklaunchicon
 
 [Run]
 ; Launch application after installation
@@ -155,13 +155,11 @@ begin
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
-var
-  ResultCode: Integer;
 begin
   if CurStep = ssPostInstall then
   begin
     // Set permissions for the installation folder
-    if not IsAdminLoggedOn then
+    if not IsAdmin then
     begin
       // For non-admin installs, ensure user has write permissions
       Log('Setting folder permissions for user access');
@@ -176,7 +174,10 @@ begin
   if CurUninstallStep = usUninstall then
   begin
     // Ask user if they want to keep their settings
-    UserChoice := MsgBox('Do you want to keep your settings and configurations?' + #13#10 +
+    if UninstallSilent then
+      UserChoice := IDYES
+    else
+      UserChoice := MsgBox('Do you want to keep your settings and configurations?' + #13#10 +
                          '(សូមរក្សាទុកការកំណត់របស់អ្នក?)', 
                          mbConfirmation, MB_YESNO or MB_DEFBUTTON1);
     
@@ -191,6 +192,8 @@ begin
       Log('User chose to delete all settings');
       // Remove the uninsneveruninstall flag by deleting manually
       DeleteFile(ExpandConstant('{app}\app_settings.json'));
+      DeleteFile(ExpandConstant('{app}\role_configs.json'));
+      DeleteFile(ExpandConstant('{app}\rvc_config.json'));
     end;
   end;
   
@@ -244,9 +247,10 @@ begin
     // Check for previous installation
     if IsUpgrade() then
     begin
-      if MsgBox('A previous version is detected. It will be uninstalled before continuing.' + #13#10 +
+      if WizardSilent or
+         (MsgBox('A previous version is detected. It will be uninstalled before continuing.' + #13#10 +
                 '(មាន version ចាស់។ វានឹងត្រូវបាន uninstall មុនពេល install ថ្មី)',
-                mbConfirmation, MB_YESNO or MB_DEFBUTTON1) = IDYES then
+                 mbConfirmation, MB_YESNO or MB_DEFBUTTON1) = IDYES) then
       begin
         UnInstallOldVersion();
       end;

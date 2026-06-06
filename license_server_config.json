@@ -1,6 +1,7 @@
 {
-  "enabled": false,
-  "api_base_url": "https://your-license-server.example.com",
-  "app_token": "change-this-public-app-token",
+  "enabled": true,
+  "api_base_url": "https://script.google.com/macros/s/AKfycbwgZ7IZCDjhtXSzyYAYTYhF--LqvmZyVOI7vSQLw1CTWvk-zG_Uc1gYfl4wZJYIFIlHTQ/exec",
+  "app_token": "srt-drama-2026-my-token",
+  "strict_online": true,
   "timeout_seconds": 15
 }

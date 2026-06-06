@@ -1,6 +1,6 @@
 ﻿# -*- coding: utf-8 -*-
 """
-SRT Drama Tool v1.0.10
+SRT Drama Tool v1.1.0
 PART 1 - Core UI + Light Accent Theme
 Author: NOU SARAT
 """
@@ -9,6 +9,7 @@ import sys
 import os
 import urllib.request
 import urllib.error
+import urllib.parse
 import zipfile
 import shutil
 import platform
@@ -37,6 +38,7 @@ import base64
 import datetime
 import tempfile
 import ctypes
+import mimetypes
 import edge_tts # type: ignore
 from typing import cast, Union, Optional, Any, Callable
 from pydub import AudioSegment
@@ -46,8 +48,8 @@ try:
     from test_gpu import detect_gpu
 except ImportError:
     detect_gpu = None
-from PyQt5.QtCore import Qt, pyqtSignal, QUrl, QTimer, QTime, QThread, QEvent
-from PyQt5.QtGui import QFont, QColor, QDesktopServices, QPixmap, QCloseEvent, QFontDatabase
+from PyQt5.QtCore import Qt, pyqtSignal, QUrl, QTimer, QTime, QThread, QEvent, QRectF, QSize
+from PyQt5.QtGui import QFont, QColor, QPixmap, QCloseEvent, QFontDatabase, QPainter, QPen, QBrush, QIcon
 from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
 from PyQt5.QtMultimediaWidgets import QGraphicsVideoItem
 from PyQt5 import sip  # For checking if QObject is deleted
@@ -55,9 +57,10 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
     QGridLayout, QLayout, QLabel, QPushButton, QLineEdit, QTextEdit, QComboBox,
     QCheckBox, QSpinBox, QDoubleSpinBox, QProgressBar, QSlider, QGroupBox,
-    QTabWidget, QScrollArea, QFileDialog, QMessageBox, QHeaderView, QTableWidget,
+    QTabWidget, QScrollArea, QScrollBar, QFileDialog, QMessageBox, QHeaderView, QTableWidget,
     QTableWidgetItem, QSplitter, QTimeEdit, QMenuBar, QMenu, QAction, QStatusBar,
-    QStyle, QDialog, QFrame, QGraphicsView, QGraphicsScene, QSizePolicy, QStackedWidget, QSplashScreen
+    QStyle, QDialog, QFrame, QGraphicsView, QGraphicsScene, QSizePolicy, QStackedWidget,
+    QSplashScreen, QListWidget, QListWidgetItem
 )
 
 # Constants for Pylance/Qt Enum compatibility
@@ -70,6 +73,15 @@ QSTYLE_SP_MEDIA_PAUSE = 63
 MEDIA_PLAYER_PLAYING = 1
 MEDIA_PLAYER_STOPPED = 0
 QT_ITEM_IS_EDITABLE = 2
+
+
+def external_process_env() -> dict[str, str]:
+    """Return an environment safe for standalone apps launched by this UI."""
+    env = os.environ.copy()
+    for name in ("QT_QPA_PLATFORM", "QT_PLUGIN_PATH", "QT_QPA_PLATFORM_PLUGIN_PATH"):
+        env.pop(name, None)
+    return env
+
 
 # =============================
 # Application Constants
@@ -120,17 +132,19 @@ def get_app_version():
         pass
     
     # Fallback to hardcoded version
-    return "1.0.10"
+    return "1.1.0"
 
 APP_VERSION = get_app_version()
 APP_NAME = "SRT Drama Tool"
 DEFAULT_UPDATE_URL = "https://github.com/saratboy1988-a11y/SRT-Drama-Tool/releases/latest"
 DEFAULT_UPDATE_API_URL = "https://api.github.com/repos/saratboy1988-a11y/SRT-Drama-Tool/releases/latest"
+DEFAULT_VOXCPM2_URL = "http://127.0.0.1:7860"
 APP_MUTEX_NAME = "Global\\SRTDramaToolSingleInstance"
 ONLINE_LICENSE_CONFIG_FILE = "license_server_config.json"
 ONLINE_LICENSE_STORE_FILE = "online_license.json"
 ONLINE_LICENSE_GRACE_DAYS = 3
 DEFAULT_KHMER_FONT = "Noto Sans Khmer"
+DEFAULT_ENGLISH_FONT = "Segoe UI Variable Text"
 KHMER_FONT_CHOICES = [
     "Noto Sans Khmer",
     "Khmer OS",
@@ -169,6 +183,14 @@ def is_newer_version(latest_version, current_version):
     latest_parts += [0] * (length - len(latest_parts))
     current_parts += [0] * (length - len(current_parts))
     return latest_parts > current_parts
+
+
+def coerce_int(value: Any, default: int = 0) -> int:
+    """Convert persisted settings safely when older project files contain null or text."""
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
 
 
 def acquire_single_instance_lock() -> bool:
@@ -252,38 +274,72 @@ def get_video_codec():
 
 
 def normalize_role_name(raw_role):
-    """Normalize role text to extract specific character name and traits."""
+    """Normalize role text to extract a Khmer character name and traits."""
     if not raw_role:
         return "Unknown"
 
-    # Support format: Name (Gender, Age) inside brackets
+    khmer_gender = {"Male": "ប្រុស", "Female": "ស្រី"}
+    khmer_age = {
+        "Child": "កុមារ",
+        "Teen": "យុវវ័យ",
+        "Adult": "ពេញវ័យ",
+        "Elder": "ចាស់",
+    }
+
+    # Support format: Name (Gender, Age) inside brackets.
     match = re.match(r'^(.*?)\s*\((.*?)\)', raw_role.strip())
     if match:
         name = match.group(1).strip()
         traits = match.group(2).lower()
+        has_explicit_traits = True
     else:
         name = raw_role.strip()
         traits = name.lower()
+        has_explicit_traits = False
+
+    is_generic_speaker = bool(
+        re.match(r"^speaker[\s_-]*\d+$", name.strip(), re.IGNORECASE)
+        or re.match(r"^អ្នកនិយាយ[\s_-]*\d+$", name.strip())
+    )
 
     gender = "Male"
-    if any(tok in traits for tok in ["female", "ស្រី", "girl", "woman"]):
+    if any(tok in traits for tok in ["female", "ស្រី", "girl", "woman", "lady", "mother", "mom", "ម្តាយ", "ម៉ែ"]):
         gender = "Female"
+    elif any(tok in traits for tok in ["male", "ប្រុស", "boy", "man", "father", "dad", "ឪពុក", "ប៉ា"]):
+        gender = "Male"
 
     age = "Adult"
-    if any(tok in traits for tok in ["child", "kid", "baby", "ក្មេង"]):
+    if any(tok in traits for tok in ["child", "kid", "baby", "ក្មេង", "កុមារ", "ទារក"]):
         age = "Child"
     elif "young adult" in traits or "young" in traits:
         age = "Adult"
-    elif any(tok in traits for tok in ["teen", "young", "យុវ", "youth"]):
+    elif any(tok in traits for tok in ["teen", "young", "យុវ", "youth", "វ័យក្មេង"]):
         age = "Teen"
-    elif any(tok in traits for tok in ["elder", "old", "grand", "ចាស់"]):
+    elif any(tok in traits for tok in ["elder", "old", "grand", "ចាស់", "ជរា", "តា", "យាយ"]):
         age = "Elder"
 
-    # If the name is just a generic gender term, return only the category
-    if name.lower() in ["male", "female", "man", "woman", "boy", "girl", "ស្រី", "ប្រុស", "lead", "supporting"]:
-        return f"{gender}, {age}"
+    khmer_trait = f"{khmer_gender[gender]}, {khmer_age[age]}"
 
-    return f"{name} ({gender}, {age})"
+    if is_generic_speaker:
+        return khmer_trait if has_explicit_traits else "Unknown"
+
+    # If the name is already a generic role category, return its Khmer canonical form.
+    generic_names = [
+        "male", "female", "man", "woman", "boy", "girl", "lead", "supporting",
+        "ស្រី", "ប្រុស", "បុរស", "នារី", "ក្មេងប្រុស", "ក្មេងស្រី",
+        "មនុស្សប្រុស", "មនុស្សស្រី", "តួអង្គប្រុស", "តួអង្គស្រី",
+    ]
+    normalized_name = re.sub(r"\s+", " ", name.lower()).strip()
+    normalized_trait = re.sub(r"\s+", " ", traits).strip()
+    if (
+        normalized_name in generic_names
+        or normalized_name == f"{gender.lower()}, {age.lower()}"
+        or normalized_name == khmer_trait
+        or normalized_trait == khmer_trait
+    ):
+        return khmer_trait
+
+    return f"{name} ({khmer_trait})"
 
 
 def get_default_role_configs():
@@ -451,6 +507,7 @@ def load_online_license_config():
         "enabled": False,
         "api_base_url": "",
         "app_token": "",
+        "strict_online": False,
         "timeout_seconds": 15,
     }
     config_paths = [
@@ -479,20 +536,35 @@ def online_license_is_enabled(config=None):
     return bool(config.get("enabled") and config.get("api_base_url"))
 
 
+def online_license_is_strict(config=None):
+    config = config or load_online_license_config()
+    return bool(online_license_is_enabled(config) and config.get("strict_online"))
+
+
 def _license_api_post(path, payload, config=None):
     config = config or load_online_license_config()
     base_url = str(config.get("api_base_url", "")).rstrip("/")
     if not base_url:
         return False, {"message": "License server is not configured."}
 
-    url = f"{base_url}{path}"
+    payload = dict(payload)
+    is_google_apps_script = "script.google.com/macros/s/" in base_url
+    if is_google_apps_script:
+        url = base_url
+        payload["_path"] = path
+        app_token = str(config.get("app_token", "")).strip()
+        if app_token:
+            payload["_app_token"] = app_token
+    else:
+        url = f"{base_url}{path}"
+
     body = json.dumps(payload).encode("utf-8")
     headers = {
         "Content-Type": "application/json",
         "User-Agent": f"{APP_NAME}/{APP_VERSION}",
     }
     app_token = str(config.get("app_token", "")).strip()
-    if app_token:
+    if app_token and not is_google_apps_script:
         headers["Authorization"] = f"Bearer {app_token}"
 
     request = urllib.request.Request(url, data=body, headers=headers, method="POST")
@@ -503,6 +575,13 @@ def _license_api_post(path, payload, config=None):
             response_body = response.read().decode("utf-8")
             return True, json.loads(response_body) if response_body else {}
     except urllib.error.HTTPError as e:
+        if is_google_apps_script and e.code in (401, 403):
+            return False, {
+                "message": (
+                    "Google Apps Script denied access. Deploy the script as a Web app with "
+                    "'Execute as: Me' and 'Who has access: Anyone', then copy the /exec URL again."
+                )
+            }
         try:
             error_body = e.read().decode("utf-8")
             data = json.loads(error_body) if error_body else {"message": str(e)}
@@ -515,9 +594,35 @@ def _license_api_post(path, payload, config=None):
         return False, {"message": str(e), "network_error": True}
 
 
-def save_online_license(data):
+def _online_license_config_fingerprint(config=None):
+    config = config or load_online_license_config()
+    raw = f"{config.get('api_base_url', '')}|{config.get('app_token', '')}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _online_token_matches_machine(token: str, machine_id: str) -> bool:
+    parts = str(token or "").split("|")
+    return len(parts) >= 3 and parts[1] == machine_id
+
+
+def _online_license_not_expired(saved: dict[str, Any]) -> bool:
+    expires_at = saved.get("expires_at")
+    if not expires_at:
+        return True
+    try:
+        expires = datetime.datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+        now = datetime.datetime.now(expires.tzinfo) if expires.tzinfo else datetime.datetime.now()
+        return now <= expires
+    except Exception:
+        return False
+
+
+def save_online_license(data, machine_id=None, config=None):
     payload = dict(data)
     payload["last_valid_at"] = datetime.datetime.now().isoformat()
+    if machine_id:
+        payload["activation_machine_id"] = machine_id
+    payload["config_fingerprint"] = _online_license_config_fingerprint(config)
     with open(get_config_path(ONLINE_LICENSE_STORE_FILE), "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
 
@@ -551,7 +656,7 @@ def activate_online_license(email, license_key, machine_id):
         config,
     )
     if ok and response.get("ok"):
-        save_online_license(response)
+        save_online_license(response, machine_id, config)
         return True, response.get("message", "Activated"), response
 
     return False, response.get("message", "Online activation failed."), response
@@ -566,6 +671,14 @@ def validate_saved_online_license(machine_id):
     token = str(saved.get("token", "")).strip()
     if not token:
         return False, "No online license token found."
+    if saved.get("activation_machine_id") and saved.get("activation_machine_id") != machine_id:
+        return False, "Saved online license belongs to another machine."
+    if not _online_token_matches_machine(token, machine_id):
+        return False, "Saved online license token does not match this machine."
+    if saved.get("config_fingerprint") and saved.get("config_fingerprint") != _online_license_config_fingerprint(config):
+        return False, "Saved online license belongs to another license server."
+    if not _online_license_not_expired(saved):
+        return False, "Saved online license expired."
 
     ok, response = _license_api_post(
         "/api/v1/licenses/check",
@@ -579,7 +692,7 @@ def validate_saved_online_license(machine_id):
     if ok and response.get("ok"):
         merged = saved.copy()
         merged.update(response)
-        save_online_license(merged)
+        save_online_license(merged, machine_id, config)
         return True, response.get("message", "Online license valid.")
 
     if response.get("network_error"):
@@ -587,6 +700,8 @@ def validate_saved_online_license(machine_id):
             last_valid_at = saved.get("last_valid_at")
             if last_valid_at:
                 last_dt = datetime.datetime.fromisoformat(last_valid_at)
+                if last_dt > datetime.datetime.now() + datetime.timedelta(minutes=5):
+                    return False, "Saved online license timestamp is invalid."
                 days = (datetime.datetime.now() - last_dt).days
                 if days <= ONLINE_LICENSE_GRACE_DAYS:
                     return True, f"Offline grace period active ({days}/{ONLINE_LICENSE_GRACE_DAYS} days)."
@@ -670,6 +785,10 @@ class LicenseDialog(QDialog):
             if valid:
                 QMessageBox.information(self, "Success", "Online activation successful!\n(Activate Online ជោគជ័យ)")
                 self.accept()
+                return
+
+            if online_license_is_strict(self.online_config):
+                QMessageBox.warning(self, "Failed", f"Online activation failed:\n{msg}")
                 return
 
             fallback_valid, fallback_msg = verify_license_key(key, self.machine_id)
@@ -968,16 +1087,17 @@ class CharacterConfigDialog(QDialog):
         self.main_window = parent
         self.edited_roles = set()
         self.setWindowTitle("TTS Configuration (ការកំណត់តួអង្គ)")
-        self.resize(600, 500)
+        self.resize(1000, 560)
         self.v_layout = QVBoxLayout(self)
         
         self.table = QTableWidget()
-        self.table.setColumnCount(4)
-        self.table.setHorizontalHeaderLabels(["Role (តួអង្គ)", "Rate (%)", "TTS Pitch (Hz)", "Status"])
+        self.table.setColumnCount(7)
+        self.table.setHorizontalHeaderLabels(["Role (តួអង្គ)", "Edge Voice", "Age", "Emotion", "Rate (%)", "TTS Pitch (Hz)", "Status"])
         header = self.table.horizontalHeader()
         if header:
             header.setSectionResizeMode(0, QHeaderView.Stretch)
-            header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+            header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+            header.setSectionResizeMode(6, QHeaderView.ResizeToContents)
         
         self.roles = parent.roles.copy()
         self.table.setRowCount(len(self.roles))
@@ -987,28 +1107,49 @@ class CharacterConfigDialog(QDialog):
             item.setFlags(cast(Qt.ItemFlags, item.flags() & ~QT_ITEM_IS_EDITABLE)) # Make Role Name Read-only (ហាមកែឈ្មោះ)
             self.table.setItem(i, 0, item)
             
+            # Standard Edge TTS voice
+            cb_voice = QComboBox()
+            cb_voice.addItem("Female Khmer - Sreymom", "km-KH-SreymomNeural")
+            cb_voice.addItem("Male Khmer - Piseth", "km-KH-PisethNeural")
+            voice_index = cb_voice.findData(parent.role_configs.get(role, {}).get("voice", "km-KH-PisethNeural"))
+            cb_voice.setCurrentIndex(max(0, voice_index))
+            self.table.setCellWidget(i, 1, cb_voice)
+            cb_voice.currentIndexChanged.connect(lambda _value, row=i, role=role: self.mark_role_edited(row, role))
+
+            cb_age = QComboBox()
+            cb_age.addItems(["Normal", "Child", "Teen", "Adult", "Elder"])
+            cb_age.setCurrentText(parent.role_configs.get(role, {}).get("age", "Adult"))
+            self.table.setCellWidget(i, 2, cb_age)
+            cb_age.currentIndexChanged.connect(lambda _value, row=i, role=role: self.mark_role_edited(row, role))
+
+            cb_emotion = QComboBox()
+            cb_emotion.addItems(["Normal", "Happy", "Sad", "Angry", "Excited"])
+            cb_emotion.setCurrentText(parent.role_configs.get(role, {}).get("emotion", "Normal"))
+            self.table.setCellWidget(i, 3, cb_emotion)
+            cb_emotion.currentIndexChanged.connect(lambda _value, row=i, role=role: self.mark_role_edited(row, role))
+
             # Rate
             sb_rate = QSpinBox()
             sb_rate.setRange(-100, 100)
             sb_rate.setSuffix("%")
-            val_rate = parent.role_configs.get(role, {}).get("rate", 0)
+            val_rate = coerce_int(parent.role_configs.get(role, {}).get("rate"), 0)
             sb_rate.setValue(val_rate)
-            self.table.setCellWidget(i, 1, sb_rate)
+            self.table.setCellWidget(i, 4, sb_rate)
             sb_rate.valueChanged.connect(lambda _value, row=i, role=role: self.mark_role_edited(row, role))
             
             # Pitch
             sb_pitch = QSpinBox()
             sb_pitch.setRange(-100, 100)
             sb_pitch.setSuffix("Hz")
-            val_pitch = parent.role_configs.get(role, {}).get("tts_pitch", 0)
+            val_pitch = coerce_int(parent.role_configs.get(role, {}).get("tts_pitch"), 0)
             sb_pitch.setValue(val_pitch)
-            self.table.setCellWidget(i, 2, sb_pitch)
+            self.table.setCellWidget(i, 5, sb_pitch)
 
             sb_pitch.valueChanged.connect(lambda _value, row=i, role=role: self.mark_role_edited(row, role))
 
             status_item = QTableWidgetItem()
             status_item.setFlags(cast(Qt.ItemFlags, status_item.flags() & ~QT_ITEM_IS_EDITABLE))
-            self.table.setItem(i, 3, status_item)
+            self.table.setItem(i, 6, status_item)
             self.apply_role_highlight(i, role)
             
         self.v_layout.addWidget(self.table)
@@ -1019,14 +1160,14 @@ class CharacterConfigDialog(QDialog):
 
     def apply_role_highlight(self, row: int, role: str) -> None:
         is_new = self.main_window.role_configs.get(role, {}).get("is_new", False)
-        status_item = self.table.item(row, 3)
+        status_item = self.table.item(row, 6)
         if status_item:
             status_item.setText("NEW" if is_new else "")
             status_item.setToolTip("New character - edit Rate or Pitch to mark as configured." if is_new else "")
 
         bg = QColor("#fff3cd") if is_new else QColor("#ffffff")
         fg = QColor("#856404") if is_new else QColor("#1f2937")
-        for col in (0, 3):
+        for col in (0, 6):
             item = self.table.item(row, col)
             if item:
                 item.setBackground(bg)
@@ -1040,7 +1181,7 @@ class CharacterConfigDialog(QDialog):
             if is_new else
             ""
         )
-        for col in (1, 2):
+        for col in (1, 2, 3, 4, 5):
             widget = self.table.cellWidget(row, col)
             if widget:
                 widget.setStyleSheet(widget_style)
@@ -1053,11 +1194,17 @@ class CharacterConfigDialog(QDialog):
         
     def save_config(self):
         for i, role in enumerate(self.roles):
-            w_rate = self.table.cellWidget(i, 1)
-            w_pitch = self.table.cellWidget(i, 2)
+            w_voice = self.table.cellWidget(i, 1)
+            w_age = self.table.cellWidget(i, 2)
+            w_emotion = self.table.cellWidget(i, 3)
+            w_rate = self.table.cellWidget(i, 4)
+            w_pitch = self.table.cellWidget(i, 5)
             
             rate = w_rate.value() if w_rate else 0
             pitch = w_pitch.value() if w_pitch else 0
+            voice = w_voice.currentData() if isinstance(w_voice, QComboBox) else "km-KH-PisethNeural"
+            age = w_age.currentText() if isinstance(w_age, QComboBox) else "Adult"
+            emotion = w_emotion.currentText() if isinstance(w_emotion, QComboBox) else "Normal"
             
             if role not in self.main_window.role_configs:
                 self.main_window.role_configs[role] = {}
@@ -1066,6 +1213,9 @@ class CharacterConfigDialog(QDialog):
                 self.main_window.role_configs[role]["is_new"] = False # Mark as configured
             self.main_window.role_configs[role]["rate"] = rate
             self.main_window.role_configs[role]["tts_pitch"] = pitch
+            self.main_window.role_configs[role]["voice"] = voice
+            self.main_window.role_configs[role]["age"] = age
+            self.main_window.role_configs[role]["emotion"] = emotion
             
         # Update the main window's list with the (potentially new) roles and save the project
         self.main_window.roles = list(self.main_window.role_configs.keys()) # Refresh roles list from updated configs
@@ -1187,6 +1337,7 @@ class FFmpegInstallThread(QThread):
                 text=True,
                 encoding='utf-8',
                 errors='ignore',
+                env=external_process_env(),
                 creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
             )
 
@@ -1271,6 +1422,7 @@ class PyTorchInstallThread(QThread):
                 text=True,
                 encoding='utf-8',
                 errors='ignore',
+                env=external_process_env(),
                 creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
             )
 
@@ -1315,22 +1467,267 @@ class PyTorchInstallThread(QThread):
             self.log_signal.emit(f"✗ Error: {e}")
             self.finished_signal.emit(False)
 
+class DubbingTimelineWidget(QWidget):
+    """Compact subtitle timeline backed by the rows in the Home table."""
+
+    def __init__(self, main_window):
+        super().__init__()
+        self.main_window = main_window
+        self.zoom = 1.0
+        self.scroll_ms = 0
+        self._drag_mode = None
+        self._drag_row = None
+        self._drag_start_x = 0
+        self._drag_original_start = 0
+        self._drag_original_end = 0
+        self.setMinimumHeight(132)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setStyleSheet("background-color: #ffffff; border: 1px solid #dbe3ef; border-radius: 5px;")
+
+    def set_zoom(self, value: int) -> None:
+        self.zoom = max(0.5, value / 100.0)
+        self._sync_scrollbar()
+        self.update()
+
+    def _sync_scrollbar(self) -> None:
+        scrollbar = getattr(self.main_window, "timeline_scrollbar", None)
+        if scrollbar is None:
+            return
+        duration = self._duration_ms(self._segments())
+        visible_duration = self._visible_duration_ms(duration)
+        max_scroll = max(0, duration - visible_duration)
+        scrollbar.blockSignals(True)
+        scrollbar.setRange(0, max_scroll)
+        scrollbar.setPageStep(max(1, visible_duration))
+        scrollbar.setSingleStep(max(100, visible_duration // 20))
+        self.scroll_ms = min(self.scroll_ms, max_scroll)
+        scrollbar.setValue(self.scroll_ms)
+        scrollbar.blockSignals(False)
+
+    def set_scroll_ms(self, value: int) -> None:
+        duration = self._duration_ms(self._segments())
+        max_scroll = max(0, duration - self._visible_duration_ms(duration))
+        self.scroll_ms = max(0, min(int(value), max_scroll))
+        self.update()
+
+    def _segments(self) -> list[tuple[int, int, int, str]]:
+        segments = []
+        table = getattr(self.main_window, "segment_table", None)
+        if table is None:
+            return segments
+        for row in range(table.rowCount()):
+            start_item = table.item(row, 0)
+            end_item = table.item(row, 1)
+            text_item = table.item(row, 4)
+            if not start_item or not end_item:
+                continue
+            segments.append((
+                row,
+                int(start_item.data(QT_USER_ROLE) or 0),
+                int(end_item.data(QT_USER_ROLE) or 0),
+                text_item.text() if text_item else "",
+            ))
+        return segments
+
+    def _duration_ms(self, segments: list[tuple[int, int, int, str]]) -> int:
+        media_duration = 0
+        player = getattr(self.main_window, "media_player", None)
+        if player is not None:
+            media_duration = max(0, int(player.duration()))
+        row_duration = max((end for _row, _start, end, _text in segments), default=0)
+        return max(media_duration, row_duration, 60000)
+
+    def _visible_duration_ms(self, duration: int) -> int:
+        return max(500, int(duration / self.zoom))
+
+    def _time_to_x(self, ms: int, visible_duration: int, width: int, left: int) -> float:
+        return left + ((ms - self.scroll_ms) / visible_duration) * width
+
+    def _x_to_time(self, x_pos: int, visible_duration: int, width: int, left: int) -> int:
+        ratio = (x_pos - left) / max(1, width)
+        return self.scroll_ms + int(ratio * visible_duration)
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        bounds = self.rect()
+        segments = self._segments()
+        duration = self._duration_ms(segments)
+        visible_duration = self._visible_duration_ms(duration)
+        self._sync_scrollbar()
+        left = 12
+        right = max(left + 1, bounds.width() - 12)
+        width = right - left
+
+        painter.setPen(QColor("#64748b"))
+        painter.setFont(QFont("Segoe UI", 7))
+        tick_ms = 30000 if visible_duration >= 180000 else 10000 if visible_duration >= 30000 else 2000
+        first_tick = (self.scroll_ms // tick_ms) * tick_ms
+        for tick in range(first_tick, self.scroll_ms + visible_duration + tick_ms, tick_ms):
+            x = self._time_to_x(tick, visible_duration, width, left)
+            painter.setPen(QPen(QColor("#e2e8f0"), 1))
+            painter.drawLine(int(x), 24, int(x), bounds.height() - 9)
+            painter.setPen(QColor("#64748b"))
+            minutes = tick // 60000
+            seconds = (tick // 1000) % 60
+            painter.drawText(int(x), 16, f"{minutes:02d}:{seconds:02d}")
+
+        painter.setPen(QColor("#334155"))
+        painter.setFont(QFont("Segoe UI", 8, QFont.Bold))
+        painter.drawText(left, 38, "T1  SUBTITLES")
+        painter.drawText(left, 92, "A1  GENERATED AUDIO")
+
+        selected_rows = set(self.main_window.get_selected_segment_rows()) if hasattr(self.main_window, "get_selected_segment_rows") else set()
+        segment_lookup = {}
+        for row, start, end, text in segments:
+            segment_lookup[row] = (start, end, text)
+            if end < self.scroll_ms or start > self.scroll_ms + visible_duration:
+                continue
+            x = self._time_to_x(start, visible_duration, width, left)
+            block_width = max(8.0, ((min(end, self.scroll_ms + visible_duration) - max(start, self.scroll_ms)) / visible_duration) * width)
+            rect = QRectF(x, 44, block_width, 32)
+            painter.setPen(QPen(QColor("#4f46e5"), 2) if row in selected_rows else Qt.NoPen)
+            painter.setBrush(QBrush(QColor("#00a878")))
+            painter.drawRoundedRect(rect, 4, 4)
+            painter.setPen(QColor("#ffffff"))
+            painter.setFont(QFont(DEFAULT_KHMER_FONT, 8))
+            painter.drawText(rect.adjusted(5, 2, -4, -2), Qt.AlignVCenter | Qt.AlignLeft, text[:24])
+
+        audio_blocks = getattr(self.main_window, "generated_audio_segments", {})
+        if audio_blocks:
+            painter.setFont(QFont("Segoe UI", 7, QFont.Bold))
+            for row, audio_info in sorted(audio_blocks.items()):
+                if row not in segment_lookup:
+                    continue
+                start, end, _text = segment_lookup[row]
+                if end < self.scroll_ms or start > self.scroll_ms + visible_duration:
+                    continue
+                x = self._time_to_x(start, visible_duration, width, left)
+                block_width = max(8.0, ((min(end, self.scroll_ms + visible_duration) - max(start, self.scroll_ms)) / visible_duration) * width)
+                rect = QRectF(x, 98, block_width, 24)
+                painter.setPen(QPen(QColor("#4338ca"), 1))
+                painter.setBrush(QBrush(QColor("#5145e5")))
+                painter.drawRoundedRect(rect, 4, 4)
+                audio_duration = int(audio_info.get("duration", max(0, end - start)))
+                target_duration = max(1, end - start)
+                speed = audio_duration / target_duration
+                painter.setPen(QColor("#ffffff"))
+                painter.drawText(rect.adjusted(5, 1, -4, -1), Qt.AlignVCenter | Qt.AlignLeft, f"▸ {speed:.1f}x")
+        else:
+            latest_audio = self.main_window.get_latest_audio_source()
+            if latest_audio and os.path.exists(latest_audio):
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QBrush(QColor("#5145e5")))
+                painter.drawRoundedRect(QRectF(left, 98, width, 22), 4, 4)
+                painter.setPen(QColor("#ffffff"))
+                painter.setFont(QFont("Segoe UI", 8, QFont.Bold))
+                painter.drawText(left + 8, 113, "Generated dub audio")
+
+        player = getattr(self.main_window, "media_player", None)
+        playhead_ms = max(0, int(player.position())) if player is not None else 0
+        if self.scroll_ms <= playhead_ms <= self.scroll_ms + visible_duration:
+            playhead_x = self._time_to_x(playhead_ms, visible_duration, width, left)
+            painter.setPen(QPen(QColor("#ef4444"), 2))
+            painter.drawLine(int(playhead_x), 22, int(playhead_x), bounds.height() - 8)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton:
+            hit = self._hit_segment(event.x(), event.y())
+            if hit:
+                row, mode = hit
+                self._drag_mode = mode
+                self._drag_row = row
+                self._drag_start_x = event.x()
+                start, end = self.main_window.get_segment_times(row)
+                self._drag_original_start = start
+                self._drag_original_end = end
+                self.main_window.segment_table.selectRow(row)
+                self.setCursor(Qt.SizeHorCursor)
+                event.accept()
+                return
+            width = max(1, self.width() - 24)
+            duration = self._duration_ms(self._segments())
+            self.main_window.set_position(self._x_to_time(event.x(), self._visible_duration_ms(duration), width, 12))
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if getattr(self, "_drag_row", None) is not None:
+            width = max(1, self.width() - 24)
+            duration = self._duration_ms(self._segments())
+            visible_duration = self._visible_duration_ms(duration)
+            delta_ms = int(((event.x() - self._drag_start_x) / width) * visible_duration)
+            row = int(self._drag_row)
+            if self._drag_mode == "move":
+                self.main_window.move_segment_time(row, self._drag_original_start + delta_ms)
+            elif self._drag_mode == "left":
+                self.main_window.update_segment_start_time(row, self._drag_original_start + delta_ms)
+            else:
+                self.main_window.update_segment_end_time(row, self._drag_original_end + delta_ms)
+            self.update()
+            event.accept()
+            return
+        hit = self._hit_segment(event.x(), event.y())
+        if hit and hit[1] in ("left", "right"):
+            self.setCursor(Qt.SizeHorCursor)
+        elif hit:
+            self.setCursor(Qt.OpenHandCursor)
+        else:
+            self.setCursor(Qt.PointingHandCursor)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        self._drag_mode = None
+        self._drag_row = None
+        self.setCursor(Qt.PointingHandCursor)
+        super().mouseReleaseEvent(event)
+
+    def _hit_segment(self, x_pos: int, y_pos: int) -> Optional[tuple[int, str]]:
+        if not (42 <= y_pos <= 78):
+            return None
+        segments = self._segments()
+        if not segments:
+            return None
+        duration = self._duration_ms(segments)
+        visible_duration = self._visible_duration_ms(duration)
+        left = 12
+        width = max(1, self.width() - 24)
+        for row, start, end, _text in segments:
+            if end < self.scroll_ms or start > self.scroll_ms + visible_duration:
+                continue
+            start_x = self._time_to_x(start, visible_duration, width, left)
+            end_x = self._time_to_x(end, visible_duration, width, left)
+            if abs(x_pos - start_x) <= 7:
+                return row, "left"
+            if abs(x_pos - end_x) <= 7:
+                return row, "right"
+            if start_x < x_pos < end_x:
+                return row, "move"
+        return None
+
+
 class MainWindow(QMainWindow):
     log_signal = pyqtSignal(str)
     play_audio_signal = pyqtSignal(str, int)
     progress_signal = pyqtSignal(int)
     progress_text_signal = pyqtSignal(str)  # NEW: For progress percentage text
+    audio_status_signal = pyqtSignal(int, str, str)
     tts_finished_signal = pyqtSignal()
     srt_finished_signal = pyqtSignal()
     export_finished_signal = pyqtSignal()
     stop_player_signal = pyqtSignal()
     video_converted_signal = pyqtSignal(str)
+    play_video_signal = pyqtSignal(str)
     merge_finished_signal = pyqtSignal(dict)
+    gemini_stage1_finished_signal = pyqtSignal(bool, str)
+    gemini_transcribe_finished_signal = pyqtSignal(bool, str)
+    gemini_original_transcript_signal = pyqtSignal(str)
+    gemini_progress_stage_signal = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION} | Dev: នូរ សារ៉ាត់")
-        self.resize(1100, 650)
+        self.resize(1500, 850)
 
         self.setFont(QFont(DEFAULT_KHMER_FONT, 10))
         self.setAcceptDrops(True)
@@ -1383,11 +1780,14 @@ class MainWindow(QMainWindow):
         # Main Layout
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
-        main_layout = QHBoxLayout(main_widget)
+        main_layout = QVBoxLayout(main_widget)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+        main_layout.addWidget(self.build_app_header())
 
         # Use Splitter for resizable layout
         splitter = QSplitter(QT_HORIZONTAL) # type: ignore
-        main_layout.addWidget(splitter)
+        main_layout.addWidget(splitter, 1)
 
         # Left: Video Player
         self.video_container = self.build_video_player()
@@ -1395,12 +1795,22 @@ class MainWindow(QMainWindow):
 
         # Right: Tabs
         self.tabs = QTabWidget() # type: ignore
+        self.tabs.tabBar().hide()
         splitter.addWidget(self.tabs)
 
         # type: ignore
         self.tabs.addTab(self.build_home_tab(), "🏠 ទំព័រដើម (Home)")
         self.tabs.addTab(self.build_export_tab(), "📤 នាំចេញ (Export)")
         self.tabs.addTab(self.build_settings_tab(), "⚙ ការកំណត់ (Settings)")
+        self.tabs.currentChanged.connect(self._update_app_header_nav)
+        self._update_app_header_nav(0)
+        splitter.setSizes([350, 1150])
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+
+        self.setStatusBar(QStatusBar())
+        self.statusBar().setStyleSheet("QStatusBar { background-color: #f8fafc; color: #334155; border-top: 1px solid #dbe3ef; }")
+        self.statusBar().showMessage("✓ System Ready")
 
         # Create menu bar
         self.create_menu_bar()
@@ -1409,14 +1819,22 @@ class MainWindow(QMainWindow):
         self.play_audio_signal.connect(self.on_play_audio)
         self.progress_signal.connect(self.progress.setValue)
         self.progress_text_signal.connect(self.update_progress_text)  # NEW: Real-time progress text
+        self.audio_status_signal.connect(self.set_row_audio_status)
         self.tts_finished_signal.connect(self.on_tts_finished)
         self.srt_finished_signal.connect(self.on_srt_finished)
         self.export_finished_signal.connect(self.on_export_finished) # type: ignore
         self.stop_player_signal.connect(self.force_stop_player)
         self.video_converted_signal.connect(self.on_video_converted)
+        self.play_video_signal.connect(self.on_play_video)
         self.merge_finished_signal.connect(self.on_merge_projects_finished)
+        self.gemini_stage1_finished_signal.connect(self._on_gemini_stage1_finished)
+        self.gemini_transcribe_finished_signal.connect(self._on_gemini_transcribe_finished)
+        self.gemini_original_transcript_signal.connect(self._on_gemini_original_transcript_ready)
+        self.gemini_progress_stage_signal.connect(self._set_gemini_progress_stage)
         self.stop_event = threading.Event()
         self.last_generated_audio = None # ចងចាំ File អូឌីយ៉ូចុងក្រោយ
+        self.generated_audio_segments = {}
+        self.original_audio_muted = True
 
         # Initialize pygame mixer for audio playback (replaces QMediaPlayer for audio)
         # This avoids Windows 11 codec issues with QMediaPlayer
@@ -1440,10 +1858,206 @@ class MainWindow(QMainWindow):
 
         self.segment_end_time = -1  # Track when to stop video playback for segment preview
         self.current_video_path = None
+        self._dub_playback_enabled = False
+        self._dub_current_row = None
         
         # Initialize SRT character detection storage
         self.srt_characters = []  # List of detected characters
         self.character_info = {}  # Character -> color mapping
+        self.gemini_original_srt = ""
+        self._gemini_one_click_khmer = False
+
+        if self.app_settings.get("voxcpm2_autostart", False):
+            QTimer.singleShot(500, lambda: self._start_voxcpm2_server(silent=True))
+
+    def build_app_header(self) -> QWidget:
+        """Build a compact top app bar with circular navigation actions."""
+        header = QFrame()
+        header.setObjectName("appHeader")
+        header.setFixedHeight(64)
+        header.setStyleSheet("""
+            QFrame#appHeader {
+                background-color: #0f172a;
+                border-bottom: 1px solid #1e293b;
+            }
+            QLabel#appLogoBadge {
+                background-color: #2563eb;
+                border: 1px solid #3b82f6;
+                border-radius: 19px;
+                padding: 3px;
+            }
+            QLabel#appHeaderTitle {
+                color: #f8fafc;
+                font-size: 13pt;
+                font-weight: 800;
+            }
+            QLabel#appHeaderSubtitle {
+                color: #93c5fd;
+                font-size: 8pt;
+            }
+            QPushButton[navCircle="true"] {
+                background-color: #1e293b;
+                color: #cbd5e1;
+                border: 1px solid #334155;
+                border-radius: 18px;
+                padding: 0;
+            }
+            QPushButton[navCircle="true"]:hover {
+                background-color: #263449;
+                border-color: #475569;
+            }
+            QPushButton[navCircle="true"]:checked {
+                background-color: #2563eb;
+                border: 1px solid #60a5fa;
+            }
+        """)
+
+        layout = QHBoxLayout(header)
+        layout.setContentsMargins(18, 8, 24, 8)
+        layout.setSpacing(10)
+
+        logo = QLabel()
+        logo.setObjectName("appLogoBadge")
+        logo.setFixedSize(42, 42)
+        logo.setAlignment(Qt.AlignCenter)
+        logo_pixmap = QPixmap(resource_path("srt_drama_tool.png"))
+        if logo_pixmap.isNull():
+            logo_pixmap = QPixmap(resource_path("splash_logo.png"))
+        if not logo_pixmap.isNull():
+            logo.setPixmap(logo_pixmap.scaled(34, 34, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        else:
+            logo.setText("D")
+        layout.addWidget(logo)
+
+        title_box = QVBoxLayout()
+        title_box.setContentsMargins(0, 0, 0, 0)
+        title_box.setSpacing(0)
+        title = QLabel(APP_NAME)
+        title.setObjectName("appHeaderTitle")
+        subtitle = QLabel("Khmer dubbing workspace")
+        subtitle.setObjectName("appHeaderSubtitle")
+        title_box.addWidget(title)
+        title_box.addWidget(subtitle)
+        layout.addLayout(title_box)
+        layout.addStretch()
+
+        self.btn_header_home = self._create_header_nav_button("Home", "Home")
+        self.btn_header_home.setIcon(self._create_header_tab_icon("home"))
+        self.btn_header_home.clicked.connect(lambda: self.show_home_page())
+        layout.addWidget(self.btn_header_home)
+
+        self.btn_header_export = self._create_header_nav_button("Export", "Export")
+        self.btn_header_export.setIcon(self._create_header_tab_icon("export"))
+        self.btn_header_export.clicked.connect(lambda: self.show_export_page())
+        layout.addWidget(self.btn_header_export)
+
+        self.btn_header_settings = self._create_header_nav_button("Settings", "Settings")
+        self.btn_header_settings.setIcon(self._create_header_tab_icon("settings"))
+        self.btn_header_settings.clicked.connect(lambda: self.show_settings_page())
+        layout.addWidget(self.btn_header_settings)
+
+        return header
+
+    def _create_header_nav_button(self, text: str, tooltip: str) -> QPushButton:
+        button = QPushButton()
+        button.setProperty("navCircle", True)
+        button.setCheckable(True)
+        button.setFixedSize(38, 38)
+        button.setIconSize(QSize(18, 18))
+        button.setCursor(Qt.PointingHandCursor)  # type: ignore[attr-defined]
+        button.setToolTip(tooltip)
+        button.setAccessibleName(text)
+        return button
+
+    def _create_header_tab_icon(self, kind: str) -> QIcon:
+        pixmap = QPixmap(24, 24)
+        pixmap.fill(Qt.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing)
+        pen = QPen(QColor("#dbeafe"), 2)
+        pen.setCapStyle(Qt.RoundCap)
+        pen.setJoinStyle(Qt.RoundJoin)
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+
+        if kind == "home":
+            painter.drawLine(5, 12, 12, 6)
+            painter.drawLine(12, 6, 19, 12)
+            painter.drawLine(7, 11, 7, 19)
+            painter.drawLine(17, 11, 17, 19)
+            painter.drawLine(7, 19, 17, 19)
+            painter.drawLine(10, 19, 10, 15)
+            painter.drawLine(10, 15, 14, 15)
+            painter.drawLine(14, 15, 14, 19)
+        elif kind == "export":
+            painter.drawRoundedRect(5, 7, 14, 12, 2, 2)
+            painter.drawLine(12, 4, 12, 13)
+            painter.drawLine(8, 9, 12, 13)
+            painter.drawLine(16, 9, 12, 13)
+            painter.drawLine(8, 19, 16, 19)
+        else:
+            painter.drawEllipse(9, 9, 6, 6)
+            painter.drawLine(12, 4, 12, 7)
+            painter.drawLine(12, 17, 12, 20)
+            painter.drawLine(4, 12, 7, 12)
+            painter.drawLine(17, 12, 20, 12)
+            painter.drawLine(7, 7, 9, 9)
+            painter.drawLine(15, 15, 17, 17)
+            painter.drawLine(17, 7, 15, 9)
+            painter.drawLine(9, 15, 7, 17)
+
+        painter.end()
+        return QIcon(pixmap)
+
+    def _professional_slider_stylesheet(self) -> str:
+        return """
+            QSlider::groove:horizontal {
+                border: none;
+                height: 5px;
+                background: #e2e8f0;
+                border-radius: 3px;
+            }
+            QSlider::sub-page:horizontal {
+                background: #2563eb;
+                border-radius: 3px;
+            }
+            QSlider::handle:horizontal {
+                background: #2563eb;
+                border: 2px solid #ffffff;
+                width: 14px;
+                height: 14px;
+                margin: -6px 0;
+                border-radius: 7px;
+            }
+            QSlider::handle:horizontal:hover {
+                background: #1d4ed8;
+            }
+        """
+
+    def show_home_page(self) -> None:
+        if hasattr(self, "tabs"):
+            self.tabs.setCurrentIndex(0)
+
+    def show_export_page(self) -> None:
+        if hasattr(self, "tabs"):
+            self.tabs.setCurrentIndex(1)
+
+    def show_settings_page(self, page_key: Optional[str] = None) -> None:
+        if hasattr(self, "tabs"):
+            self.tabs.setCurrentIndex(2)
+        if page_key:
+            self._show_settings_page(page_key)
+
+    def _update_app_header_nav(self, index: Optional[int] = None) -> None:
+        current = self.tabs.currentIndex() if hasattr(self, "tabs") else int(index or 0)
+        button_map = {
+            0: getattr(self, "btn_header_home", None),
+            1: getattr(self, "btn_header_export", None),
+            2: getattr(self, "btn_header_settings", None),
+        }
+        for page_index, button in button_map.items():
+            if button is not None:
+                button.setChecked(page_index == current)
 
     def safe_emit_signal(self, signal, *args):
         """Safely emit signal only if window is not deleted (Fix: race condition)"""
@@ -1462,17 +2076,21 @@ class MainWindow(QMainWindow):
         if role_name in self.role_configs:
             return # type: ignore
 
-        # Extract traits from name if in "Name (Gender, Age)" format
+        # Extract traits from name if in "Name (Gender, Age)" or "ឈ្មោះ (ភេទ, អាយុ)" format.
         gender = "Male"
         age = "Adult"
         
         if "(" in role_name and ")" in role_name:
             try:
                 traits = role_name.split("(")[1].split(")")[0].lower()
-                if "female" in traits: gender = "Female"
-                if "child" in traits: age = "Child"
-                elif "teen" in traits: age = "Teen"
-                elif "elder" in traits: age = "Elder"
+                if any(token in traits for token in ("female", "ស្រី", "នារី", "ម្តាយ", "ម៉ែ")):
+                    gender = "Female"
+                if any(token in traits for token in ("child", "កុមារ", "ក្មេង", "ទារក")):
+                    age = "Child"
+                elif any(token in traits for token in ("teen", "យុវ", "វ័យក្មេង")):
+                    age = "Teen"
+                elif any(token in traits for token in ("elder", "ចាស់", "ជរា", "តា", "យាយ")):
+                    age = "Elder"
             except:
                 pass
 
@@ -1498,7 +2116,16 @@ class MainWindow(QMainWindow):
 
     def start_worker_thread(self, target, args=(), daemon=True):
         """Fix Bug #18: Start and track worker threads for graceful shutdown"""
-        t = threading.Thread(target=target, args=args, daemon=daemon)
+        def run_and_cleanup():
+            try:
+                target(*args)
+            finally:
+                current = threading.current_thread()
+                with self.worker_threads_lock:
+                    if current in self.worker_threads:
+                        self.worker_threads.remove(current)
+
+        t = threading.Thread(target=run_and_cleanup, daemon=daemon)
         with self.worker_threads_lock:
             self.worker_threads.append(t)
         t.start()
@@ -1528,11 +2155,15 @@ class MainWindow(QMainWindow):
 
         try:
             if sys.platform == 'win32':
-                os.startfile(path)
+                subprocess.Popen(
+                    ["cmd.exe", "/d", "/c", "start", "", os.path.abspath(path)],
+                    env=self._external_process_env(),
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
             elif sys.platform == 'darwin':  # macOS
-                subprocess.Popen(['open', path])
+                subprocess.Popen(['open', path], env=self._external_process_env())
             else:  # Linux
-                subprocess.Popen(['xdg-open', path])
+                subprocess.Popen(['xdg-open', path], env=self._external_process_env())
             return True
         except Exception as e:
             self.safe_log(f"⚠️ Failed to open {path}: {e}")
@@ -1632,7 +2263,7 @@ class MainWindow(QMainWindow):
         return font_name.strip()
 
     def apply_app_font(self) -> None:
-        font_name = self.get_selected_khmer_font()
+        font_name = DEFAULT_ENGLISH_FONT
         app = QApplication.instance()
         font = QFont(font_name, 10)
         if app and isinstance(app, QApplication):
@@ -1642,15 +2273,14 @@ class MainWindow(QMainWindow):
             self.apply_log_font_style()
 
     def apply_log_font_style(self) -> None:
-        font_name = self.get_selected_khmer_font()
-        self.log_box.setFont(QFont(font_name, 12)) # type: ignore
+        self.log_box.setFont(QFont(DEFAULT_ENGLISH_FONT, 12)) # type: ignore
         self.log_box.setStyleSheet(f"""
             QTextEdit {{
                 background-color: #f8f9fa;
                 border: 2px solid #dee2e6;
                 border-radius: 6px;
                 padding: 10px;
-                font-family: {self._font_stack(font_name)};
+                font-family: {self._font_stack(self.get_selected_khmer_font())};
                 font-size: 12pt;
             }}
         """)
@@ -1659,15 +2289,23 @@ class MainWindow(QMainWindow):
     def _font_stack(primary_font: str) -> str:
         safe_font = primary_font.replace("\\", "\\\\").replace('"', '\\"')
         fallback_fonts = [
+            DEFAULT_ENGLISH_FONT,
+            "Segoe UI",
+            "Inter",
+            "Arial",
             DEFAULT_KHMER_FONT,
             "Khmer OS",
             "Khmer OS System",
-            "Segoe UI",
             "sans-serif",
         ]
-        fonts = [safe_font]
+        fonts = []
         for font in fallback_fonts:
-            if font != primary_font:
+            if font not in fonts:
+                fonts.append(font)
+        if safe_font not in fonts:
+            fonts.insert(4, safe_font)
+        for font in fallback_fonts:
+            if font not in fonts:
                 fonts.append(font)
         return ", ".join(f'"{font}"' if font != "sans-serif" else font for font in fonts)
 
@@ -1945,20 +2583,93 @@ class MainWindow(QMainWindow):
 
     def build_video_player(self):
         widget = QWidget()
+        widget.setObjectName("workspaceSidebar")
+        widget.setMinimumWidth(320)
+        widget.setMaximumWidth(390)
+        widget.setStyleSheet("""
+            QWidget#workspaceSidebar {
+                background-color: #ffffff;
+                border-right: 1px solid #cbd5e1;
+            }
+            QLabel#workspaceBrand {
+                color: #172033;
+                font-size: 14pt;
+                font-weight: 700;
+            }
+            QLabel#sidebarSection {
+                color: #172033;
+                font-size: 10pt;
+                font-weight: 700;
+                padding-top: 4px;
+            }
+            QPushButton#workspaceTool {
+                background-color: #f8fafc;
+                color: #0f172a;
+                border: 1px solid #cbd5e1;
+                border-radius: 6px;
+                min-height: 48px;
+                padding: 6px;
+                font-weight: 700;
+            }
+            QPushButton#workspaceTool:hover {
+                background-color: #eef2f7;
+                border-color: #94a3b8;
+            }
+            QPushButton#workspacePrimary {
+                background-color: #2563eb;
+                color: #ffffff;
+                border: none;
+                border-radius: 6px;
+                min-height: 38px;
+                font-weight: 700;
+            }
+            QPushButton#workspacePrimary:hover {
+                background-color: #1d4ed8;
+            }
+            QPushButton#workspaceDanger {
+                background-color: #ffffff;
+                color: #dc2626;
+                border: 1px solid #fecaca;
+                border-radius: 6px;
+                min-height: 34px;
+                font-weight: 700;
+            }
+            QPushButton#workspaceDanger:hover {
+                background-color: #fef2f2;
+            }
+        """)
         layout = QVBoxLayout(widget)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(10)
+        layout.setContentsMargins(14, 12, 14, 10)
+        layout.setSpacing(9)
+
+        brand_row = QHBoxLayout()
+        brand = QLabel("SRT Drama Tool")
+        brand.setObjectName("workspaceBrand")
+        brand_row.addWidget(brand)
+        brand_badge = QLabel("DESKTOP")
+        brand_badge.setStyleSheet("color: #f59e0b; background: #fff7ed; border: 1px solid #fed7aa; border-radius: 6px; padding: 2px 5px; font-size: 7pt; font-weight: bold;")
+        brand_row.addWidget(brand_badge)
+        brand_row.addStretch()
+        brand_widget = QWidget()
+        brand_widget.setLayout(brand_row)
+        brand_widget.setVisible(False)
+        layout.addWidget(brand_widget)
+
+        self.sidebar_project_label = QLabel("No video loaded")
+        self.sidebar_project_label.setStyleSheet("color: #64748b; font-size: 9pt; padding-bottom: 2px;")
+        self.sidebar_project_label.setVisible(False)
+        layout.addWidget(self.sidebar_project_label)
         
         # Video Widget
         self.video_scene = QGraphicsScene()
         self.video_view = QGraphicsView(self.video_scene)
-        self.video_view.setMinimumSize(280, 500) # ទំហំសមាមាត្រ 9:16 (Portrait)
+        self.video_view.setMinimumSize(280, 330) # ទំហំសមាមាត្រ 9:16 (Portrait)
         self.video_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         # បន្ថែមស៊ុមជុំវិញ និងធ្វើឱ្យជ្រុងមូល (Mobile Phone Look)
         self.video_view.setStyleSheet("""
             QGraphicsView {
-                border: 12px solid #1a202c;
-                border-radius: 25px;
+                border: 7px solid #111827;
+                border-radius: 12px;
                 background-color: black;
             }
         """)
@@ -1987,11 +2698,30 @@ class MainWindow(QMainWindow):
         style = self.style()
         if style:
             self.play_btn.setIcon(style.standardIcon(QSTYLE_SP_MEDIA_PLAY)) # type: ignore
+        self.play_btn.setToolTip("Play/Pause generated dub preview when available. Shortcut: Space")
+        self.play_btn.setFixedSize(38, 32)
+        self.play_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #f8fafc;
+                border: 1px solid #cbd5e1;
+                border-radius: 6px;
+                color: #0f172a;
+            }
+            QPushButton:hover {
+                background-color: #eef2f7;
+                border-color: #94a3b8;
+            }
+            QPushButton:disabled {
+                background-color: #f1f5f9;
+                color: #94a3b8;
+            }
+        """)
         self.play_btn.clicked.connect(self.play_video)
         controls.addWidget(self.play_btn)
         
         self.position_slider = QSlider(QT_HORIZONTAL) # type: ignore
         self.position_slider.setRange(0, 0)
+        self.position_slider.setStyleSheet(self._professional_slider_stylesheet())
         self.position_slider.sliderMoved.connect(self.set_position)
         controls.addWidget(self.position_slider)
         
@@ -2003,28 +2733,63 @@ class MainWindow(QMainWindow):
         # Offset Control (សម្រាប់កំណត់ម៉ោងចាប់ផ្តើមវីដេអូ)
         offset_layout = QHBoxLayout()
         offset_layout.setContentsMargins(10, 0, 10, 0)
-        offset_layout.addWidget(QLabel("Video Offset (ម៉ោងចាប់ផ្តើមវីដេអូ):"))
+        offset_layout.addWidget(QLabel("Video Offset:"))
         
         self.time_offset_edit = QLineEdit("00:00:00,000")
         self.time_offset_edit.setInputMask("99:99:99,999")
         self.time_offset_edit.setToolTip("កំណត់ម៉ោងចាប់ផ្តើមនៃវីដេអូនេះធៀបនឹងអត្ថបទដើម\n(Example: If this is Ep2 starting at 10min, enter 00:10:00,000)")
         offset_layout.addWidget(self.time_offset_edit)
-        layout.addLayout(offset_layout)
+        offset_widget = QWidget()
+        offset_widget.setLayout(offset_layout)
+        offset_widget.setVisible(False)
+        layout.addWidget(offset_widget)
         
-        # Load Button
-        btn_layout = QHBoxLayout()
-        btn_layout.setContentsMargins(10, 0, 10, 10)
-        btn_load = QPushButton("📂 Open Video (បើកវីដេអូ)")
+        section = QLabel("Workspace Tools")
+        section.setObjectName("sidebarSection")
+        layout.addWidget(section)
+
+        btn_layout = QGridLayout()
+        btn_layout.setSpacing(8)
+        btn_load = QPushButton("Load\nVideo")
+        btn_load.setObjectName("workspaceTool")
         btn_load.clicked.connect(self.open_video_file)
-        btn_layout.addWidget(btn_load)
+        btn_layout.addWidget(btn_load, 0, 0)
         
-        # Fix Playback Button
-        btn_fix = QPushButton("🛠️ Fix Playback")
-        btn_fix.setToolTip("Convert video to MP4 if it doesn't play.\n(បម្លែងវីដេអូប្រសិនបើវាលេងមិនកើត)")
-        btn_fix.clicked.connect(self.convert_and_play_video)
-        btn_layout.addWidget(btn_fix)
+        btn_sync_sidebar = QPushButton("Sync\nSRT")
+        btn_sync_sidebar.setObjectName("workspaceTool")
+        btn_sync_sidebar.setToolTip("បញ្ចូល SRT ពីរ (មួយយកនាទីដើម មួយយកអត្ថបទបកប្រែ)")
+        btn_sync_sidebar.clicked.connect(self.load_dual_srt)
+        btn_layout.addWidget(btn_sync_sidebar, 0, 1)
+
+        btn_import_srt = QPushButton("Import\nSRT")
+        btn_import_srt.setObjectName("workspaceTool")
+        btn_import_srt.clicked.connect(self.load_srt)
+        btn_layout.addWidget(btn_import_srt, 1, 0)
+
+        btn_export_srt = QPushButton("Export\nSRT")
+        btn_export_srt.setObjectName("workspaceTool")
+        btn_export_srt.clicked.connect(self.export_srt_file)
+        btn_layout.addWidget(btn_export_srt, 1, 1)
+
+        self.btn_mute_original_audio = QPushButton("Audio\nMuted")
+        self.btn_mute_original_audio.setObjectName("workspaceTool")
+        self.btn_mute_original_audio.setCheckable(True)
+        self.btn_mute_original_audio.setChecked(True)
+        self.btn_mute_original_audio.setToolTip("Mute original video audio during TTS preview/playback.")
+        self.btn_mute_original_audio.clicked.connect(self.toggle_original_audio_muted)
+        btn_layout.addWidget(self.btn_mute_original_audio, 2, 0, 1, 2)
         
         layout.addLayout(btn_layout)
+
+        btn_render = QPushButton("Final Render")
+        btn_render.setObjectName("workspacePrimary")
+        btn_render.clicked.connect(self.show_export_page)
+        layout.addWidget(btn_render)
+
+        btn_clear = QPushButton("Clear Subtitle Data")
+        btn_clear.setObjectName("workspaceDanger")
+        btn_clear.clicked.connect(self.clear_all_segments)
+        layout.addWidget(btn_clear)
         
         return widget
 
@@ -2035,6 +2800,27 @@ class MainWindow(QMainWindow):
     def resizeEvent(self, a0):
         self.video_view.fitInView(self.video_item, Qt.AspectRatioMode.KeepAspectRatio)
         super().resizeEvent(a0)
+
+    def eventFilter(self, watched, event) -> bool:
+        if (
+            hasattr(self, "segment_table")
+            and hasattr(self, "transcribe_table_overlay")
+            and watched is self.segment_table.viewport()
+            and event.type() == QEvent.Resize
+        ):
+            self._position_transcribe_table_overlay()
+        return super().eventFilter(watched, event)
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key_Space and not event.isAutoRepeat():
+            focused = QApplication.focusWidget()
+            if isinstance(focused, (QLineEdit, QTextEdit, QSpinBox, QDoubleSpinBox, QComboBox)):
+                super().keyPressEvent(event)
+                return
+            self.play_video()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def open_video_file(self):
         last_dir = getattr(self, 'app_settings', {}).get("last_video_dir", "")
@@ -2048,9 +2834,12 @@ class MainWindow(QMainWindow):
             return
 
         self.current_video_path = path
+        if hasattr(self, "sidebar_project_label"):
+            self.sidebar_project_label.setText(f"Project: {os.path.basename(path)}")
         if hasattr(self, "video_item"):
             self.video_item.setVisible(True)
         self.media_player.setMedia(QMediaContent(QUrl.fromLocalFile(path)))
+        self.media_player.setMuted(getattr(self, "original_audio_muted", True))
         self.play_btn.setEnabled(True)
         if hasattr(self, 'app_settings'):
             self.app_settings["last_video_dir"] = os.path.dirname(path)
@@ -2063,9 +2852,91 @@ class MainWindow(QMainWindow):
     def play_video(self):
         if self.media_player.state() == MEDIA_PLAYER_PLAYING:
             self.media_player.pause()
+            self._stop_preview_audio()
         else:
+            if self._has_generated_audio_clips():
+                self._start_generated_dub_preview()
+            else:
+                self._dub_playback_enabled = False
+                self.media_player.setMuted(getattr(self, "original_audio_muted", True))
             self.media_player.play()
             self.segment_end_time = -1
+
+    def _set_original_audio_muted_ui(self, muted: bool) -> None:
+        self.original_audio_muted = muted
+        self.media_player.setMuted(muted)
+        if hasattr(self, "btn_mute_original_audio"):
+            self.btn_mute_original_audio.blockSignals(True)
+            self.btn_mute_original_audio.setChecked(muted)
+            self.btn_mute_original_audio.setText("Audio\nMuted" if muted else "Original\nAudio")
+            self.btn_mute_original_audio.blockSignals(False)
+
+    def _has_generated_audio_clips(self) -> bool:
+        for audio_info in getattr(self, "generated_audio_segments", {}).values():
+            path = str(audio_info.get("path", "") or "")
+            if path and os.path.exists(path):
+                return True
+        return False
+
+    def _start_generated_dub_preview(self) -> None:
+        self._dub_playback_enabled = True
+        self._dub_current_row = None
+        self._set_original_audio_muted_ui(True)
+        self.log("▶ Playing generated Khmer dub preview. Original video audio muted.")
+
+    def _stop_preview_audio(self) -> None:
+        if getattr(self, "pygame_audio_available", False):
+            try:
+                if pygame.mixer.music.get_busy():
+                    pygame.mixer.music.stop()
+            except Exception:
+                pass
+        if hasattr(self, "preview_player"):
+            self.preview_player.stop()
+        self._dub_current_row = None
+
+    def _sync_generated_dub_audio(self, position_ms: int) -> None:
+        if not getattr(self, "_dub_playback_enabled", False):
+            return
+        if self.media_player.state() != MEDIA_PLAYER_PLAYING:
+            return
+        current_match = None
+        for row, audio_info in sorted(getattr(self, "generated_audio_segments", {}).items()):
+            path = str(audio_info.get("path", "") or "")
+            start = int(audio_info.get("start", 0) or 0)
+            end = int(audio_info.get("end", start) or start)
+            if path and os.path.exists(path) and start <= position_ms <= end:
+                current_match = (int(row), path, start)
+                break
+
+        if not current_match:
+            if getattr(self, "_dub_current_row", None) is not None:
+                self._stop_preview_audio()
+            return
+
+        row, path, start = current_match
+        if getattr(self, "_dub_current_row", None) == row:
+            return
+        self._dub_current_row = row
+        start_seconds = max(0.0, (position_ms - start) / 1000.0)
+        if getattr(self, "pygame_audio_available", False):
+            try:
+                if pygame.mixer.music.get_busy():
+                    pygame.mixer.music.stop()
+                pygame.mixer.music.load(path)
+                try:
+                    pygame.mixer.music.play(start=start_seconds)
+                except TypeError:
+                    pygame.mixer.music.play()
+                return
+            except Exception as e:
+                self.log(f"⚠️ Generated dub playback failed: {e}")
+        self.preview_player.setMedia(QMediaContent(QUrl.fromLocalFile(path)))
+        self.preview_player.play()
+
+    def toggle_original_audio_muted(self, checked: bool) -> None:
+        self._set_original_audio_muted_ui(checked)
+        self.log("🔇 Original video audio muted." if checked else "🔊 Original video audio enabled.")
 
     def media_state_changed(self, state):
         style = self.style()
@@ -2075,10 +2946,14 @@ class MainWindow(QMainWindow):
             self.play_btn.setIcon(style.standardIcon(QSTYLE_SP_MEDIA_PAUSE)) # type: ignore
         else:
             self.play_btn.setIcon(style.standardIcon(QSTYLE_SP_MEDIA_PLAY)) # type: ignore
+            self._stop_preview_audio()
 
     def position_changed(self, position):
-        self.position_slider.setValue(position)
+        safe_position = self._qt_int_ms(position, "video position")
+        self.position_slider.setValue(safe_position)
         self.update_duration_label(position)
+        self._refresh_timeline()
+        self._sync_generated_dub_audio(safe_position)
         
         if self.segment_end_time != -1:
             if position >= self.segment_end_time:
@@ -2086,10 +2961,26 @@ class MainWindow(QMainWindow):
                 self.segment_end_time = -1
 
     def duration_changed(self, duration):
-        self.position_slider.setRange(0, duration)
+        self.position_slider.setRange(0, self._qt_int_ms(duration, "video duration"))
 
     def set_position(self, position):
-        self.media_player.setPosition(position)
+        self.media_player.setPosition(self._qt_int_ms(position, "video seek"))
+        self._stop_preview_audio()
+
+    def _qt_int_ms(self, value: Any, label: str = "timestamp") -> int:
+        """Clamp millisecond values passed to Qt widgets that use signed 32-bit ints."""
+        try:
+            number = int(value)
+        except (TypeError, ValueError, OverflowError):
+            self.log(f"⚠️ Invalid {label}: {value!r}. Using 0ms.")
+            return 0
+        maximum = 2147483647
+        if number < 0:
+            return 0
+        if number > maximum:
+            self.log(f"⚠️ {label.title()} exceeds Qt limit. Clamped to {maximum}ms.")
+            return maximum
+        return number
 
     def update_duration_label(self, current_ms):
         duration_ms = self.media_player.duration()
@@ -2128,8 +3019,7 @@ class MainWindow(QMainWindow):
 
                 if reply == QMessageBox.Yes:
                     # Switch to Settings tab and trigger FFmpeg install
-                    self.tabs.setCurrentIndex(2)  # Settings tab
-                    self._show_settings_page("software")  # Required Software page
+                    self.show_settings_page("software")  # Required Software page
                     QTimer.singleShot(500, lambda: self.install_ffmpeg_auto())
                     QMessageBox.information(
                         self, "Installing FFmpeg",
@@ -2264,6 +3154,10 @@ class MainWindow(QMainWindow):
         self.load_video(new_path, autoplay=True)
         QMessageBox.information(self, "Success", "Video converted and loaded successfully!\n(បម្លែងជោគជ័យ)")
 
+    def on_play_video(self, path: str) -> None:
+        """Load an exported video into the built-in player from the UI thread."""
+        self.load_video(path, autoplay=True)
+
     def dragEnterEvent(self, a0):
         if a0:
             mime = a0.mimeData()
@@ -2282,9 +3176,6 @@ class MainWindow(QMainWindow):
                 self.load_video(f)
                 break
             elif f.lower().endswith(('.srt', '.vtt')):
-                self.open_project(f)
-                break
-            elif f.lower().endswith('.srt'):
                 self.load_srt(f)
                 break
 
@@ -2299,6 +3190,9 @@ class MainWindow(QMainWindow):
         main_layout.setContentsMargins(0, 0, 0, 0)
         
         splitter = QSplitter(QT_VERTICAL) # type: ignore
+        splitter.setHandleWidth(4)
+        splitter.setChildrenCollapsible(False)
+        splitter.setStyleSheet("QSplitter::handle:vertical { height: 4px; background-color: #e5e7eb; }")
         main_layout.addWidget(splitter)
 
         # --- Top Controls Area ---
@@ -2314,12 +3208,17 @@ class MainWindow(QMainWindow):
         self.text_input.setMaximumHeight(45)
         input_row.addWidget(self.text_input)
 
-        self.btn_generate = QPushButton("🔊 TTS") # type: ignore
+        self.btn_generate = QPushButton("TTS") # type: ignore
         self.btn_generate.clicked.connect(self.generate_tts)
         self.btn_generate.setFixedWidth(80)
         self.btn_generate.setFixedHeight(45)
         input_row.addWidget(self.btn_generate)
-        layout.addLayout(input_row) # type: ignore
+        # Keep manual TTS widgets available for existing logic, but hide the
+        # large Home editor to prioritize the subtitle table.
+        self.text_input.setParent(controls_widget)
+        self.text_input.hide()
+        self.btn_generate.setParent(controls_widget)
+        self.btn_generate.hide()
 
         # 2. Settings Group (Grid Layout for compactness)
         settings_group = QGroupBox("Settings (ការកំណត់)")
@@ -2328,14 +3227,10 @@ class MainWindow(QMainWindow):
         settings_layout.setSpacing(8)
 
         self.roles = [
-            "Male, Child", "Female, Child",
-            "Male, Adult", "Female, Adult",
-            "Male, Elder", "Female, Elder",
+            "ប្រុស, កុមារ", "ស្រី, កុមារ",
+            "ប្រុស, ពេញវ័យ", "ស្រី, ពេញវ័យ",
+            "ប្រុស, ចាស់", "ស្រី, ចាស់",
             "Unknown"
-            "Male, Child", "Female, Child", # type: ignore
-            "Male, Adult", "Female, Adult", # type: ignore
-            "Male, Elder", "Female, Elder", # type: ignore
-            "Unknown" # type: ignore
         ]
 
         # type: ignore
@@ -2344,9 +3239,8 @@ class MainWindow(QMainWindow):
         self.voice_combo.addItems(self.roles)
         self.voice_combo.currentIndexChanged.connect(self.on_combo_role_changed)
         
-        self.btn_tts_config = QPushButton("⚙")
-        self.btn_tts_config.setFixedWidth(30)
-        self.btn_tts_config.setToolTip("TTS Config")
+        self.btn_tts_config = QPushButton("⚙ Config")
+        self.btn_tts_config.setToolTip("Configure Edge TTS voices, ages, emotions, rates, and pitches for characters")
         self.btn_tts_config.clicked.connect(self.open_tts_config)
 
         self.age_combo = QComboBox() # type: ignore
@@ -2354,6 +3248,11 @@ class MainWindow(QMainWindow):
         
         self.emotion_combo = QComboBox() # type: ignore
         self.emotion_combo.addItems(["Normal", "Happy", "Sad", "Angry", "Excited"])
+
+        self.edge_voice_combo = QComboBox()
+        self.edge_voice_combo.addItem("Female Khmer - Sreymom", "km-KH-SreymomNeural")
+        self.edge_voice_combo.addItem("Male Khmer - Piseth", "km-KH-PisethNeural")
+        self.edge_voice_combo.setToolTip("Choose the Standard Edge TTS voice for the selected character.")
 
         settings_layout.addWidget(QLabel("Role:"), 0, 0) # type: ignore
         role_box = QHBoxLayout()
@@ -2398,64 +3297,277 @@ class MainWindow(QMainWindow):
         
         settings_layout.addWidget(btn_save_role, 1, 6)
 
-        settings_group.setLayout(settings_layout)
-        layout.addWidget(settings_group)
+        settings_layout.addWidget(QLabel("Edge Voice:"), 2, 0)
+        settings_layout.addWidget(self.edge_voice_combo, 2, 1, 1, 2)
+        edge_voice_note = QLabel("Used by Standard Edge TTS for every row of the selected character.")
+        edge_voice_note.setStyleSheet("color: #6c757d;")
+        settings_layout.addWidget(edge_voice_note, 2, 3, 1, 4)
 
-        # 4. Operations & Manual Entry (Horizontal Layout)
+        settings_group.setLayout(settings_layout)
+        # Character settings now live in the compact Config dialog.
+        settings_group.setParent(controls_widget)
+        settings_group.hide()
+        self.on_combo_role_changed()
+
+        # Compact workspace toolbar
+        toolbar_frame = QFrame()
+        toolbar_frame.setObjectName("homeToolbar")
+        toolbar_frame.setStyleSheet("""
+            QFrame#homeToolbar {
+                background-color: #ffffff;
+                border: 1px solid #dbe3ef;
+                border-radius: 8px;
+            }
+            QFrame#homeToolbar QPushButton {
+                background-color: #1f2937;
+                color: #ffffff;
+                min-height: 18px;
+                padding: 7px 13px;
+                border-radius: 5px;
+                font-size: 9pt;
+                font-weight: 700;
+            }
+            QFrame#homeToolbar QPushButton:hover {
+                background-color: #111827;
+            }
+            QFrame#homeToolbar QPushButton:disabled {
+                background-color: #e2e8f0;
+                color: #94a3b8;
+            }
+        """)
+        toolbar_layout = QVBoxLayout(toolbar_frame)
+        toolbar_layout.setContentsMargins(8, 7, 8, 7)
+        toolbar_layout.setSpacing(6)
+
+        brand_layout = QHBoxLayout()
+        brand_layout.setContentsMargins(2, 0, 2, 0)
+        brand_layout.setSpacing(8)
+
+        brand_title = QLabel("DUBBING WORKSPACE")
+        brand_title.setStyleSheet("""
+            color: #1e293b;
+            font-family: Segoe UI;
+            font-size: 12pt;
+            font-weight: 700;
+        """)
+        brand_layout.addWidget(brand_title)
+
+        brand_version = QLabel(f"v{APP_VERSION}")
+        brand_version.setStyleSheet("""
+            color: #2563eb;
+            background-color: #eff6ff;
+            border: 1px solid #bfdbfe;
+            border-radius: 4px;
+            padding: 2px 6px;
+            font-size: 8pt;
+            font-weight: 700;
+        """)
+        brand_layout.addWidget(brand_version)
+
+        brand_subtitle = QLabel("Subtitle editor")
+        brand_subtitle.setStyleSheet("color: #64748b; font-size: 9pt;")
+        brand_layout.addWidget(brand_subtitle)
+        brand_layout.addStretch()
+        toolbar_layout.addLayout(brand_layout)
+
         ops_layout = QHBoxLayout()
+        ops_layout.setSpacing(6)
         
         # SRT Controls
-        self.btn_srt = QPushButton("📂 SRT") # type: ignore
+        self.btn_srt = QPushButton("SRT") # type: ignore
         self.btn_srt.clicked.connect(self.load_srt)
         
-        self.btn_sync_srt = QPushButton("🔗 Sync SRT") # type: ignore
+        self.btn_sync_srt = QPushButton("Sync SRT") # type: ignore
         self.btn_sync_srt.setToolTip("បញ្ចូល SRT ពីរ (មួយយកនាទីដើម មួយយកអត្ថបទបកប្រែ)")
         self.btn_sync_srt.clicked.connect(self.load_dual_srt)
+
+        self.btn_home_gemini_transcribe = QPushButton("Gemini SRT")
+        self.btn_home_gemini_transcribe.setToolTip("Transcribe the opened video with Gemini and load subtitles into the table")
+        self.btn_home_gemini_transcribe.clicked.connect(self._start_home_gemini_transcribe)
+        self.btn_home_gemini_transcribe.setStyleSheet("background-color: #2563eb; color: white; font-weight: bold;")
         
-        self.btn_run_srt = QPushButton("▶ Run") # type: ignore
+        self.btn_run_srt = QPushButton("Run") # type: ignore
         self.btn_run_srt.clicked.connect(self.run_srt_conversion)
         self.btn_run_srt.setEnabled(False)
         
-        self.btn_stop_srt = QPushButton("⏹ Stop") # type: ignore
+        self.btn_stop_srt = QPushButton("Stop") # type: ignore
         self.btn_stop_srt.clicked.connect(self.stop_processing)
         self.btn_stop_srt.setEnabled(False)
-        self.btn_stop_srt.setStyleSheet("background-color: #e53e3e; color: white; font-weight: bold;")
+        self.btn_stop_srt.setVisible(False)
+        self.btn_stop_srt.setStyleSheet("""
+            QPushButton {
+                background-color: #dc2626;
+                color: white;
+                font-weight: 700;
+                border-radius: 5px;
+                padding: 7px 13px;
+            }
+            QPushButton:hover {
+                background-color: #b91c1c;
+            }
+            QPushButton:disabled {
+                background-color: #e5e7eb;
+                color: #94a3b8;
+            }
+        """)
         
         self.chk_auto_fit = QCheckBox("Auto-Fit") # type: ignore
         self.chk_auto_fit.setToolTip("Adjust audio speed to fit segment duration")
-        self.chk_auto_fit.setChecked(True)
+        self.chk_auto_fit.setChecked(bool(self.app_settings.get("auto_fit", True)))
+        self.chk_auto_fit.toggled.connect(self._on_auto_fit_setting_changed)
 
         ops_layout.addWidget(self.btn_srt)
-        ops_layout.addWidget(self.btn_sync_srt)
+        ops_layout.addWidget(self.btn_home_gemini_transcribe)
         ops_layout.addWidget(self.btn_run_srt)
         ops_layout.addWidget(self.btn_stop_srt)
-        ops_layout.addWidget(self.chk_auto_fit)
         
-        btn_goto_export = QPushButton("📤 Go to Export")
-        # type: ignore
         btn_goto_export = QPushButton("📤 Go to Export") # type: ignore
-        btn_goto_export.clicked.connect(lambda: self.tabs.setCurrentIndex(1))
+        btn_goto_export.clicked.connect(self.show_export_page)
         ops_layout.addWidget(btn_goto_export)
+
+        self.btn_toggle_manual_segment = QPushButton("＋ Segment")
+        self.btn_toggle_manual_segment.setCheckable(True)
+        self.btn_toggle_manual_segment.setToolTip("Show or hide manual subtitle entry")
+        self.btn_toggle_manual_segment.clicked.connect(self._toggle_manual_segment_entry)
+        self.btn_toggle_manual_segment.setVisible(False)
+
+        # Import, transcribe, generate, and export are exposed in the sidebar
+        # and timeline. Keep these widgets alive for existing processing logic.
+        self.btn_srt.setVisible(False)
+        self.btn_home_gemini_transcribe.setVisible(False)
+        self.btn_run_srt.setVisible(False)
+        btn_goto_export.setVisible(False)
         
         # Spacer
         ops_layout.addStretch()
         
-        # type: ignore
-        # Manual Entry (Compact)
+        toolbar_layout.addLayout(ops_layout)
+
+        # Manual subtitle entry stays hidden until requested.
+        self.manual_entry_frame = QFrame()
+        self.manual_entry_frame.setObjectName("manualEntry")
+        self.manual_entry_frame.setStyleSheet("""
+            QFrame#manualEntry {
+                background-color: #f8fafc;
+                border-top: 1px solid #e2e8f0;
+            }
+        """)
+        manual_layout = QHBoxLayout(self.manual_entry_frame)
+        manual_layout.setContentsMargins(0, 6, 0, 0)
+        manual_layout.setSpacing(6)
+        manual_layout.addWidget(QLabel("New subtitle:"))
         self.manual_start = QLineEdit("00:00:00,000"); self.manual_start.setInputMask("99:99:99,999"); self.manual_start.setFixedWidth(85)
         self.manual_end = QLineEdit("00:00:00,000"); self.manual_end.setInputMask("99:99:99,999"); self.manual_end.setFixedWidth(85)
-        self.manual_text = QLineEdit(); self.manual_text.setPlaceholderText("Text...")
-        btn_add_seg = QPushButton("➕")
+        self.manual_text = QLineEdit(); self.manual_text.setPlaceholderText("Subtitle text...")
+        btn_add_seg = QPushButton("＋ Add")
         btn_add_seg.clicked.connect(self.add_manual_segment)
-        btn_add_seg.setFixedWidth(40)
+        manual_layout.addWidget(self.manual_start)
+        manual_layout.addWidget(self.manual_end)
+        manual_layout.addWidget(self.manual_text, 1)
+        manual_layout.addWidget(btn_add_seg)
+        self.manual_entry_frame.setVisible(False)
+        toolbar_layout.addWidget(self.manual_entry_frame)
+        layout.addWidget(toolbar_frame)
 
-        ops_layout.addWidget(self.manual_start)
-        ops_layout.addWidget(self.manual_end)
-        ops_layout.addWidget(self.manual_text)
-        ops_layout.addWidget(btn_add_seg)
+        tts_options_frame = QFrame()
+        tts_options_frame.setObjectName("ttsOptions")
+        tts_options_frame.setStyleSheet("""
+            QFrame#ttsOptions {
+                background-color: #f8fafc;
+                border: 1px solid #dbe3ef;
+                border-radius: 8px;
+            }
+            QFrame#ttsOptions QComboBox {
+                background-color: #ffffff;
+                color: #0f172a;
+                border: 1px solid #cbd5e1;
+                border-radius: 6px;
+                padding: 6px 10px;
+                min-height: 20px;
+            }
+            QFrame#ttsOptions QComboBox:focus {
+                border: 1px solid #2563eb;
+            }
+        """)
+        tts_scope_layout = QHBoxLayout()
+        tts_scope_layout.setContentsMargins(8, 5, 8, 5)
+        tts_scope_layout.setSpacing(6)
+        tts_scope_layout.addWidget(QLabel("Engine"))
+        self.home_tts_engine_combo = QComboBox()
+        self.home_tts_engine_combo.addItem("Standard Edge TTS", "edge")
+        self.home_tts_engine_combo.addItem("VoxCPM2 AI", "voxcpm2")
+        self.home_tts_engine_combo.setCurrentIndex(1 if self.app_settings.get("voxcpm2_enabled", False) else 0)
+        self.home_tts_engine_combo.currentIndexChanged.connect(self._on_home_tts_engine_changed)
+        tts_scope_layout.addWidget(self.home_tts_engine_combo)
 
-        # type: ignore
-        layout.addLayout(ops_layout)
+        self.home_voxcpm2_frame = QFrame()
+        self.home_voxcpm2_frame.setObjectName("homeVoxCPM2Frame")
+        self.home_voxcpm2_frame.setStyleSheet("""
+            QFrame#homeVoxCPM2Frame {
+                background-color: #eff6ff;
+                border: 1px solid #bfdbfe;
+                border-radius: 6px;
+            }
+        """)
+        home_vox_layout = QHBoxLayout(self.home_voxcpm2_frame)
+        home_vox_layout.setContentsMargins(6, 3, 6, 3)
+        home_vox_layout.setSpacing(5)
+        home_vox_layout.addWidget(QLabel("Voice"))
+        self.home_voxcpm2_voice_mode_combo = QComboBox()
+        self.home_voxcpm2_voice_mode_combo.addItem("All Characters", "all")
+        self.home_voxcpm2_voice_mode_combo.addItem("Single Voice", "single")
+        mode_index = self.home_voxcpm2_voice_mode_combo.findData(self.app_settings.get("voxcpm2_voice_mode", "all"))
+        self.home_voxcpm2_voice_mode_combo.setCurrentIndex(max(0, mode_index))
+        self.home_voxcpm2_voice_mode_combo.currentIndexChanged.connect(self._on_home_voxcpm2_controls_changed)
+        home_vox_layout.addWidget(self.home_voxcpm2_voice_mode_combo)
+
+        self.home_voxcpm2_speaker_combo = QComboBox()
+        self.home_voxcpm2_speaker_combo.setMinimumWidth(135)
+        self.home_voxcpm2_speaker_combo.addItem(str(self.app_settings.get("voxcpm2_default_speaker", "") or "Default"))
+        self.home_voxcpm2_speaker_combo.currentIndexChanged.connect(self._on_home_voxcpm2_controls_changed)
+        home_vox_layout.addWidget(self.home_voxcpm2_speaker_combo)
+
+        btn_home_vox_refresh = QPushButton("↻")
+        btn_home_vox_refresh.setToolTip("Refresh VoxCPM2 voice profiles")
+        btn_home_vox_refresh.setFixedSize(28, 24)
+        btn_home_vox_refresh.clicked.connect(self._refresh_voxcpm2_speaker_profiles)
+        home_vox_layout.addWidget(btn_home_vox_refresh)
+
+        btn_home_vox_test = QPushButton("Test")
+        btn_home_vox_test.setToolTip("Test VoxCPM2 server connection")
+        btn_home_vox_test.setFixedWidth(45)
+        btn_home_vox_test.clicked.connect(self._test_voxcpm2_connection)
+        home_vox_layout.addWidget(btn_home_vox_test)
+
+        btn_home_vox_start = QPushButton("Start")
+        btn_home_vox_start.setToolTip("Start configured VoxCPM2 local server")
+        btn_home_vox_start.setFixedWidth(50)
+        btn_home_vox_start.clicked.connect(self._start_voxcpm2_server)
+        home_vox_layout.addWidget(btn_home_vox_start)
+        tts_scope_layout.addWidget(self.home_voxcpm2_frame)
+
+        tts_scope_layout.addSpacing(8)
+        tts_scope_layout.addWidget(QLabel("Characters"))
+        self.tts_scope_combo = QComboBox()
+        self.tts_scope_combo.addItem("All Subtitle Rows", "all_tags")
+        self.tts_scope_combo.addItem("Selected Character Only", "selected")
+        saved_scope = self.app_settings.get("tts_character_scope", "all_tags")
+        scope_index = self.tts_scope_combo.findData(saved_scope)
+        self.tts_scope_combo.setCurrentIndex(max(0, scope_index))
+        self.tts_scope_combo.currentIndexChanged.connect(self._on_tts_scope_changed)
+        tts_scope_layout.addWidget(self.tts_scope_combo)
+
+        self.tts_scope_role_combo = QComboBox()
+        self.tts_scope_role_combo.currentTextChanged.connect(self._save_tts_scope_settings)
+        tts_scope_layout.addWidget(self.tts_scope_role_combo)
+        self.tts_scope_note = QLabel()
+        self.tts_scope_note.setStyleSheet("color: #6c757d;")
+        tts_scope_layout.addWidget(self.tts_scope_note, 1)
+        tts_options_frame.setLayout(tts_scope_layout)
+        layout.addWidget(tts_options_frame)
+        self._refresh_tts_scope_roles()
+        self._on_tts_scope_changed()
+        self._sync_home_voxcpm2_controls()
 
         # Progress Bar (Made larger for better visibility)
         self.progress = QProgressBar()
@@ -2463,59 +3575,336 @@ class MainWindow(QMainWindow):
         self.progress.setMinimumHeight(25)  # Ensure minimum height
         self.progress.setStyleSheet("""
             QProgressBar {
-                border: 2px solid #a0aec0;
+                border: 1px solid #cbd5e1;
                 border-radius: 6px;
                 text-align: center;
-                background-color: #edf2f7;
-                font-size: 11pt;
-                font-weight: bold;
-                color: #2d3748;
+                background-color: #f8fafc;
+                font-size: 9pt;
+                font-weight: 700;
+                color: #334155;
             }
             QProgressBar::chunk {
-                background-color: #4299e1;
+                background-color: #2563eb;
                 border-radius: 4px;
             }
         """)
         layout.addWidget(self.progress)
+
+        self.gemini_home_status = QLabel("")
+        self.gemini_home_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.gemini_home_status.setFixedHeight(22)
+        self.gemini_home_status.setStyleSheet("color: #007bff; font-weight: bold;")
+        self.gemini_home_status.setVisible(False)
+        layout.addWidget(self.gemini_home_status)
         
         # type: ignore
         # Credit Label
         lbl_credit = QLabel("Dev: នូរ សារ៉ាត់ | Tel: 096 22 11 947 | YT: @TechFree2026")
         lbl_credit.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lbl_credit.setStyleSheet("color: #718096; font-size: 9pt; margin-top: 5px;")
-        layout.addWidget(lbl_credit)
+        lbl_credit.setVisible(False)
 
         # Add Controls to Splitter (via ScrollArea for safety)
         scroll_area = QScrollArea() # type: ignore
         scroll_area.setWidget(controls_widget)
         scroll_area.setWidgetResizable(True)
         scroll_area.setFrameShape(QFrame.NoFrame) # No border
-        scroll_area.setMaximumHeight(380) # Limit height
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll_area.setMinimumHeight(142)
+        scroll_area.setMaximumHeight(172)
+        self.home_controls_scroll_area = scroll_area
         splitter.addWidget(scroll_area)
 
         # --- Bottom Table Area ---
         table_container = QWidget()
         table_layout = QVBoxLayout(table_container)
-        table_layout.setContentsMargins(10, 0, 10, 10) # type: ignore
+        table_layout.setContentsMargins(10, 0, 10, 8) # type: ignore
+        table_layout.setSpacing(7)
+
+        subtitle_header = QHBoxLayout()
+        subtitle_title = QLabel("▤  Subtitle Data")
+        subtitle_title.setStyleSheet("color: #334155; font-weight: 700; font-size: 10pt;")
+        subtitle_header.addWidget(subtitle_title)
+        subtitle_header.addStretch()
+        secondary_action_style = """
+            QPushButton {
+                background-color: #ffffff;
+                color: #334155;
+                border: 1px solid #cbd5e1;
+                border-radius: 5px;
+                padding: 6px 12px;
+                font-size: 9pt;
+                font-weight: 700;
+            }
+            QPushButton:hover {
+                background-color: #f1f5f9;
+                border-color: #94a3b8;
+            }
+            QPushButton:checked {
+                background-color: #eff6ff;
+                color: #1d4ed8;
+                border-color: #93c5fd;
+            }
+        """
+        self.btn_check_all_segments = QPushButton("All")
+        self.btn_check_all_segments.setCheckable(True)
+        self.btn_check_all_segments.setToolTip("Tick or untick every subtitle row for audio generation.")
+        self.btn_check_all_segments.setStyleSheet(secondary_action_style)
+        self.btn_check_all_segments.toggled.connect(self._toggle_all_segment_checks)
+        subtitle_header.addWidget(self.btn_check_all_segments)
+        subtitle_header.addWidget(QLabel("Set all voices to:"))
+        btn_toggle_duration = QPushButton("Duration")
+        btn_toggle_duration.setCheckable(True)
+        btn_toggle_duration.setChecked(True)
+        btn_toggle_duration.setToolTip("Show or hide the editable duration column")
+        btn_toggle_duration.setStyleSheet(secondary_action_style)
+        btn_toggle_duration.toggled.connect(lambda checked: self.segment_table.setColumnHidden(2, not checked))
+        subtitle_header.addWidget(btn_toggle_duration)
+        btn_all_male = QPushButton("ប្រុស")
+        btn_all_male.setStyleSheet(secondary_action_style)
+        btn_all_male.clicked.connect(lambda: self._set_all_segment_roles("ប្រុស, ពេញវ័យ"))
+        subtitle_header.addWidget(btn_all_male)
+        btn_all_female = QPushButton("ស្រី")
+        btn_all_female.setStyleSheet(secondary_action_style)
+        btn_all_female.clicked.connect(lambda: self._set_all_segment_roles("ស្រី, ពេញវ័យ"))
+        subtitle_header.addWidget(btn_all_female)
+        table_layout.addLayout(subtitle_header)
 
         # Segment List Table
         self.segment_table = QTableWidget()
         self.segment_table.setColumnCount(6)
-        self.segment_table.setHorizontalHeaderLabels(["Start", "End", "Duration", "Role", "Text", "Actions"])
+        self.segment_table.setHorizontalHeaderLabels(["✓ START", "END", "DURATION", "VOICE PROFILE", "KHMER TEXT (EDITABLE)", "AUDIO STATUS"])
         header = self.segment_table.horizontalHeader()
         if header:
             header.setSectionResizeMode(4, QHeaderView.Stretch)
             header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
             header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+            header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
         self.segment_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.segment_table.setAlternatingRowColors(True) # type: ignore
-        table_layout.addWidget(self.segment_table)
+        self.segment_table.setShowGrid(False)
+        self.segment_table.verticalHeader().setVisible(False)
+        self.segment_table.verticalHeader().setDefaultSectionSize(38)
+        self.segment_table.setColumnHidden(2, False)
+        self.segment_table.setStyleSheet("""
+            QTableWidget {
+                background-color: #ffffff;
+                alternate-background-color: #f8fafc;
+                border: 1px solid #e2e8f0;
+                border-radius: 4px;
+                selection-background-color: #dbeafe;
+                selection-color: #1e293b;
+            }
+            QHeaderView::section {
+                background-color: #f1f5f9;
+                color: #334155;
+                border: none;
+                border-bottom: 1px solid #cbd5e1;
+                padding: 9px 8px;
+                font-weight: bold;
+            }
+        """)
+        self.segment_table.itemChanged.connect(self._on_segment_table_item_changed)
+        self.segment_table.viewport().installEventFilter(self)
+        self.transcribe_table_overlay = QLabel(self.segment_table.viewport())
+        self.transcribe_table_overlay.setAlignment(Qt.AlignCenter)
+        self.transcribe_table_overlay.setWordWrap(True)
+        self.transcribe_table_overlay.setStyleSheet("""
+            QLabel {
+                background-color: rgba(255, 255, 255, 235);
+                color: #334155;
+                font-size: 11pt;
+                font-weight: 600;
+                border: none;
+                padding: 18px;
+            }
+        """)
+        self.transcribe_table_overlay.hide()
+        self.transcribe_spinner_frames = ["◐", "◓", "◑", "◒"]
+        self.transcribe_spinner_index = 0
+        self.transcribe_overlay_stage = ""
+        self.transcribe_overlay_timer = QTimer(self)
+        self.transcribe_overlay_timer.timeout.connect(self._animate_transcribe_table_overlay)
+        table_layout.addWidget(self.segment_table, 1)
+
+        timeline_header = QHBoxLayout()
+        timeline_title = QLabel("Timeline Editor")
+        timeline_title.setStyleSheet("color: #172033; font-weight: 700;")
+        timeline_header.addWidget(timeline_title)
+        timeline_header.addSpacing(12)
+        timeline_header.addWidget(QLabel("Zoom:"))
+        self.timeline_zoom_slider = QSlider(QT_HORIZONTAL)
+        self.timeline_zoom_slider.setRange(50, 1000)
+        self.timeline_zoom_slider.setValue(100)
+        self.timeline_zoom_slider.setFixedWidth(190)
+        self.timeline_zoom_slider.setStyleSheet(self._professional_slider_stylesheet())
+        timeline_header.addWidget(self.timeline_zoom_slider)
+        self.timeline_zoom_label = QLabel("100%")
+        self.timeline_zoom_label.setStyleSheet("color: #64748b; font-size: 8pt;")
+        timeline_header.addWidget(self.timeline_zoom_label)
+        timeline_header.addStretch()
+        self.btn_timeline_transcribe = QPushButton("Transcribe Khmer")
+        self.btn_timeline_transcribe.setToolTip("One-click workflow: transcribe the video, translate to Khmer, and load the result into the segment table.")
+        self.btn_timeline_transcribe.setStyleSheet("background-color: #059669; color: white; font-weight: 700; border-radius: 5px; padding: 6px 12px;")
+        self.btn_timeline_transcribe.clicked.connect(self._start_home_gemini_transcribe)
+        timeline_header.addWidget(self.btn_timeline_transcribe)
+        self.btn_timeline_translate = QPushButton("Translate Khmer")
+        self.btn_timeline_translate.setToolTip("Step 3: translate the current table SRT to Khmer using Gemini and the Character Profiles rules.")
+        self.btn_timeline_translate.setStyleSheet("background-color: #2563eb; color: white; font-weight: 700; border-radius: 5px; padding: 6px 12px;")
+        self.btn_timeline_translate.clicked.connect(self._start_gemini_translate_stage3)
+        timeline_header.addWidget(self.btn_timeline_translate)
+        self.btn_timeline_capcut_video_translate = QPushButton("CapCut + Video")
+        self.btn_timeline_capcut_video_translate.setToolTip("Use the current CapCut SRT timing, then ask Gemini to watch/listen to the video, tag speakers, and translate to Khmer while preserving timestamps.")
+        self.btn_timeline_capcut_video_translate.setStyleSheet("background-color: #0f766e; color: white; font-weight: 700; border-radius: 5px; padding: 6px 12px;")
+        self.btn_timeline_capcut_video_translate.clicked.connect(self._start_gemini_capcut_video_translate)
+        timeline_header.addWidget(self.btn_timeline_capcut_video_translate)
+        self.btn_clean_speaker_tags = QPushButton("Clean Tags")
+        self.btn_clean_speaker_tags.setToolTip("Remove speaker tags and Gemini metadata from the editable subtitle text, while keeping voice profiles.")
+        self.btn_clean_speaker_tags.setStyleSheet("background-color: #475569; color: white; font-weight: 700; border-radius: 5px; padding: 6px 12px;")
+        self.btn_clean_speaker_tags.clicked.connect(self.clean_current_table_tags)
+        timeline_header.addWidget(self.btn_clean_speaker_tags)
+        self.btn_stop_gemini_transcribe = QPushButton("Stop Transcribing")
+        self.btn_stop_gemini_transcribe.setToolTip("Stop the current Gemini transcribe/translate job")
+        self.btn_stop_gemini_transcribe.setStyleSheet("background-color: #dc2626; color: white; font-weight: 700; border-radius: 5px; padding: 6px 12px;")
+        self.btn_stop_gemini_transcribe.clicked.connect(self._stop_gemini_job)
+        self.btn_stop_gemini_transcribe.setVisible(False)
+        timeline_header.addWidget(self.btn_stop_gemini_transcribe)
+        self.btn_timeline_audio = QPushButton("Generate Selected Audio")
+        self.btn_timeline_audio.setToolTip("Generate audio for checked/selected subtitle rows. If nothing is selected, generate all rows.")
+        self.btn_timeline_audio.setStyleSheet("background-color: #4f46e5; color: white; font-weight: 700; border-radius: 5px; padding: 6px 12px;")
+        self.btn_timeline_audio.clicked.connect(self.run_srt_conversion)
+        timeline_header.addWidget(self.btn_timeline_audio)
+        table_layout.addLayout(timeline_header)
+
+        self.timeline_widget = DubbingTimelineWidget(self)
+        self.timeline_zoom_slider.valueChanged.connect(self.timeline_widget.set_zoom)
+        self.timeline_zoom_slider.valueChanged.connect(lambda value: self.timeline_zoom_label.setText(f"{value}%"))
+        table_layout.addWidget(self.timeline_widget)
+        self.timeline_scrollbar = QScrollBar(QT_HORIZONTAL)
+        self.timeline_scrollbar.valueChanged.connect(self.timeline_widget.set_scroll_ms)
+        table_layout.addWidget(self.timeline_scrollbar)
         
         splitter.addWidget(table_container)
+        splitter.setSizes([185, 805])
         splitter.setStretchFactor(0, 0) # Controls minimize
         splitter.setStretchFactor(1, 1) # Table maximizes
 
         return main_widget
+
+    def _refresh_timeline(self, *_args) -> None:
+        if hasattr(self, "timeline_widget"):
+            self.timeline_widget.update()
+
+    def _position_transcribe_table_overlay(self) -> None:
+        if not hasattr(self, "transcribe_table_overlay") or not hasattr(self, "segment_table"):
+            return
+        self.transcribe_table_overlay.setGeometry(self.segment_table.viewport().rect())
+
+    def _khmer_gemini_stage_text(self, stage: str) -> str:
+        lowered = stage.lower()
+        if "upload" in lowered:
+            return "កំពុង Upload វីដេអូទៅ Gemini..."
+        if "processing" in lowered or "waiting" in lowered:
+            return "កំពុងរៀបចំវីដេអូ សូមរង់ចាំ..."
+        if "transcrib" in lowered:
+            return "កំពុងស្តាប់ និងបង្កើត Subtitle តាម Segment..."
+        if "translat" in lowered:
+            return "កំពុងបកប្រែ Subtitle ទៅជាភាសាខ្មែរ..."
+        if "capcut" in lowered:
+            return "កំពុងចាប់អ្នកនិយាយ និងបកប្រែតាម Timing របស់ CapCut..."
+        return stage or "កំពុងដំណើរការ..."
+
+    def _show_transcribe_table_overlay(self, stage: str) -> None:
+        if not hasattr(self, "transcribe_table_overlay"):
+            return
+        self.transcribe_overlay_stage = self._khmer_gemini_stage_text(stage)
+        self.transcribe_spinner_index = 0
+        self._position_transcribe_table_overlay()
+        self._animate_transcribe_table_overlay()
+        self.transcribe_table_overlay.raise_()
+        self.transcribe_table_overlay.show()
+        if hasattr(self, "transcribe_overlay_timer") and not self.transcribe_overlay_timer.isActive():
+            self.transcribe_overlay_timer.start(180)
+
+    def _hide_transcribe_table_overlay(self) -> None:
+        if hasattr(self, "transcribe_overlay_timer"):
+            self.transcribe_overlay_timer.stop()
+        if hasattr(self, "transcribe_table_overlay"):
+            self.transcribe_table_overlay.hide()
+
+    def _animate_transcribe_table_overlay(self) -> None:
+        if not hasattr(self, "transcribe_table_overlay"):
+            return
+        frame = self.transcribe_spinner_frames[self.transcribe_spinner_index % len(self.transcribe_spinner_frames)]
+        self.transcribe_spinner_index += 1
+        self.transcribe_table_overlay.setText(
+            f"<div style='font-size:28pt; color:#5145e5;'>{frame}</div>"
+            f"<div style='margin-top:8px;'>{self.transcribe_overlay_stage}</div>"
+            "<div style='margin-top:7px; font-size:9pt; color:#64748b; font-weight:400;'>"
+            "លទ្ធផលនឹងបង្ហាញក្នុងតារាង Segment ដោយស្វ័យប្រវត្តិ • ចុច Stop Transcribing ដើម្បីបញ្ឈប់"
+            "</div>"
+        )
+
+    def _clear_generated_audio_state(self) -> None:
+        self.last_generated_audio = None
+        self.generated_audio_segments = {}
+        if hasattr(self, "segment_table"):
+            for row in range(self.segment_table.rowCount()):
+                self.set_row_audio_status(row, "Ready", "ready")
+        self._refresh_timeline()
+
+    def _clear_generated_audio_row(self, row: int) -> None:
+        if hasattr(self, "generated_audio_segments"):
+            self.generated_audio_segments.pop(row, None)
+        self.set_row_audio_status(row, "Ready", "ready")
+        self._refresh_timeline()
+
+    def _on_segment_table_item_changed(self, *_args) -> None:
+        item = _args[0] if _args else None
+        if isinstance(item, QTableWidgetItem) and item.column() == 0:
+            self._sync_check_all_segments_button()
+            self._refresh_timeline()
+            return
+        if isinstance(item, QTableWidgetItem):
+            self._clear_generated_audio_row(item.row())
+        else:
+            self._clear_generated_audio_state()
+
+    def _toggle_all_segment_checks(self, checked: bool) -> None:
+        if not hasattr(self, "segment_table"):
+            return
+        self.segment_table.blockSignals(True)
+        state = Qt.Checked if checked else Qt.Unchecked
+        for row in range(self.segment_table.rowCount()):
+            item = self.segment_table.item(row, 0)
+            if item:
+                item.setCheckState(state)
+        self.segment_table.blockSignals(False)
+        self.btn_check_all_segments.setText("All")
+        self._refresh_timeline()
+
+    def _sync_check_all_segments_button(self) -> None:
+        if not hasattr(self, "btn_check_all_segments") or not hasattr(self, "segment_table"):
+            return
+        total = self.segment_table.rowCount()
+        checked = 0
+        for row in range(total):
+            item = self.segment_table.item(row, 0)
+            if item and item.checkState() == Qt.Checked:
+                checked += 1
+        all_checked = total > 0 and checked == total
+        self.btn_check_all_segments.blockSignals(True)
+        self.btn_check_all_segments.setChecked(all_checked)
+        self.btn_check_all_segments.setText("All")
+        self.btn_check_all_segments.blockSignals(False)
+
+    def _set_all_segment_roles(self, role: str) -> None:
+        for row in range(self.segment_table.rowCount()):
+            combo = self.segment_table.cellWidget(row, 3)
+            if isinstance(combo, QComboBox):
+                combo.setCurrentText(role)
+        self._refresh_timeline()
 
     # =============================
     # Export Tab (Professional Sidebar Design)
@@ -3036,10 +4425,14 @@ class MainWindow(QMainWindow):
         self.chk_include_time = QCheckBox("Include cue timings")
         self.chk_include_time.setChecked(True)
         self.chk_include_filename = QCheckBox("Include file name")
+        self.chk_include_character_tags = QCheckBox("Include character TAGS")
+        self.chk_include_character_tags.setChecked(True)
+        self.chk_include_character_tags.setToolTip("Export subtitle text with role labels such as [ប្រុស, ចាស់]")
 
         opts_layout.addWidget(self.chk_empty_line)
         opts_layout.addWidget(self.chk_include_time)
         opts_layout.addWidget(self.chk_include_filename)
+        opts_layout.addWidget(self.chk_include_character_tags)
         opts_layout.addStretch()
 
         # type: ignore
@@ -3211,6 +4604,8 @@ class MainWindow(QMainWindow):
             ("⚡", "quick", "Quick Actions"),
             ("📦", "software", "Required Software"),
             ("💾", "autosave", "Auto-Save"),
+            ("🎙", "voxcpm2", "VoxCPM2 AI"),
+            ("📝", "gemini", "Gemini Transcribe"),
             ("⚙", "config", "Configuration"),
             ("🔐", "license", "License"),
             ("⬆", "update", "Update"),
@@ -3222,6 +4617,8 @@ class MainWindow(QMainWindow):
             self._create_quick_actions_page(),
             self._create_software_page(),
             self._create_autosave_page(),
+            self._create_voxcpm2_page(),
+            self._create_gemini_transcribe_page(),
             self._create_config_page(),
             self._create_license_page(),
             self._create_update_page(),
@@ -3240,11 +4637,13 @@ class MainWindow(QMainWindow):
             "quick": 1,
             "software": 2,
             "autosave": 3,
-            "config": 4,
-            "license": 5,
-            "update": 6,
-            "logs": 7,
-            "about": 8
+            "voxcpm2": 4,
+            "gemini": 5,
+            "config": 6,
+            "license": 7,
+            "update": 8,
+            "logs": 9,
+            "about": 10
         }
         self._show_sidebar_page(page_key, self.menu_buttons, self.settings_stack, page_map)
 
@@ -3307,8 +4706,6 @@ class MainWindow(QMainWindow):
 
         layout.addLayout(cards_layout)
         layout.addStretch()
-        layout.addLayout(cards_layout) # type: ignore
-        layout.addStretch() # type: ignore
 
         return scroll
 
@@ -3793,8 +5190,6 @@ class MainWindow(QMainWindow):
         autosave_layout.addWidget(desc)
 
         autosave_group.setLayout(autosave_layout)
-        # type: ignore
-        autosave_group.setLayout(autosave_layout) # type: ignore
         layout.addWidget(autosave_group)
 
         # Start timer if enabled
@@ -3804,10 +5199,334 @@ class MainWindow(QMainWindow):
 
         return scroll
 
+    def _create_voxcpm2_page(self):
+        """Create VoxCPM2 local server settings page."""
+        scroll = self._create_page_container("VoxCPM2 AI", "🎙")
+        layout = scroll._page_layout
+
+        connection_group = QGroupBox("Local VoxCPM2 Server")
+        connection_group.setFont(QFont("Segoe UI", 11, QFont.Bold))
+        form = QFormLayout()
+        form.setSpacing(14)
+
+        self.chk_voxcpm2_enabled = QCheckBox("Enable VoxCPM2 AI for voice generation")
+        self.chk_voxcpm2_enabled.setChecked(self.app_settings.get("voxcpm2_enabled", False))
+        self.chk_voxcpm2_enabled.stateChanged.connect(self._save_voxcpm2_settings)
+        form.addRow(self.chk_voxcpm2_enabled)
+
+        self.chk_voxcpm2_autostart = QCheckBox("Auto start the local server when the app opens")
+        self.chk_voxcpm2_autostart.setChecked(self.app_settings.get("voxcpm2_autostart", False))
+        self.chk_voxcpm2_autostart.stateChanged.connect(self._save_voxcpm2_settings)
+        form.addRow(self.chk_voxcpm2_autostart)
+
+        self.chk_voxcpm2_stop_on_close = QCheckBox("Stop the local server when the app closes")
+        self.chk_voxcpm2_stop_on_close.setChecked(self.app_settings.get("voxcpm2_stop_on_close", True))
+        self.chk_voxcpm2_stop_on_close.stateChanged.connect(self._save_voxcpm2_settings)
+        form.addRow(self.chk_voxcpm2_stop_on_close)
+
+        url_row = QHBoxLayout()
+        self.voxcpm2_url_input = QLineEdit(self.app_settings.get("voxcpm2_url", DEFAULT_VOXCPM2_URL))
+        self.voxcpm2_url_input.setPlaceholderText(DEFAULT_VOXCPM2_URL)
+        self.voxcpm2_url_input.editingFinished.connect(self._save_voxcpm2_settings)
+        url_row.addWidget(self.voxcpm2_url_input)
+        btn_test = QPushButton("Test Connect")
+        btn_test.clicked.connect(self._test_voxcpm2_connection)
+        self._style_voxcpm2_button(btn_test, "#007bff", "#0056b3", 125)
+        url_row.addWidget(btn_test)
+        form.addRow("Server URL:", url_row)
+
+        server_row = QHBoxLayout()
+        self.voxcpm2_server_path_input = QLineEdit(self.app_settings.get("voxcpm2_server_path", ""))
+        self.voxcpm2_server_path_input.setPlaceholderText("Optional path to app.py, .bat, or .exe")
+        self.voxcpm2_server_path_input.editingFinished.connect(self._save_voxcpm2_settings)
+        server_row.addWidget(self.voxcpm2_server_path_input)
+        btn_server_browse = QPushButton("Browse")
+        btn_server_browse.clicked.connect(self._browse_voxcpm2_server_path)
+        self._style_voxcpm2_button(btn_server_browse, "#6c757d", "#545b62", 95)
+        server_row.addWidget(btn_server_browse)
+        btn_start = QPushButton("Start Server")
+        btn_start.clicked.connect(self._start_voxcpm2_server)
+        self._style_voxcpm2_button(btn_start, "#28a745", "#1e7e34", 125)
+        server_row.addWidget(btn_start)
+        btn_stop = QPushButton("Stop Server")
+        btn_stop.clicked.connect(self._stop_voxcpm2_server)
+        self._style_voxcpm2_button(btn_stop, "#dc3545", "#bd2130", 120)
+        server_row.addWidget(btn_stop)
+        form.addRow("Server App Path:", server_row)
+
+        reference_row = QHBoxLayout()
+        self.voxcpm2_reference_input = QLineEdit(self.app_settings.get("voxcpm2_reference_audio", ""))
+        self.voxcpm2_reference_input.setPlaceholderText("Optional voice cloning reference WAV file")
+        self.voxcpm2_reference_input.editingFinished.connect(self._save_voxcpm2_settings)
+        reference_row.addWidget(self.voxcpm2_reference_input)
+        btn_reference_browse = QPushButton("Browse")
+        btn_reference_browse.clicked.connect(self._browse_voxcpm2_reference_audio)
+        self._style_voxcpm2_button(btn_reference_browse, "#6c757d", "#545b62", 95)
+        reference_row.addWidget(btn_reference_browse)
+        form.addRow("Reference Audio:", reference_row)
+
+        self.voxcpm2_status_label = QLabel("Not tested")
+        self.voxcpm2_status_label.setStyleSheet("color: #6c757d; font-weight: bold;")
+        form.addRow("Status:", self.voxcpm2_status_label)
+
+        connection_group.setLayout(form)
+        layout.addWidget(connection_group)
+
+        voice_group = QGroupBox("Voice Profile Selection")
+        voice_group.setFont(QFont("Segoe UI", 11, QFont.Bold))
+        voice_form = QFormLayout()
+
+        self.voxcpm2_voice_mode_combo = QComboBox()
+        self.voxcpm2_voice_mode_combo.addItem("All Characters (Auto Match)", "all")
+        self.voxcpm2_voice_mode_combo.addItem("Single Voice for All Characters", "single")
+        saved_voice_mode = self.app_settings.get("voxcpm2_voice_mode", "all")
+        voice_mode_index = self.voxcpm2_voice_mode_combo.findData(saved_voice_mode)
+        self.voxcpm2_voice_mode_combo.setCurrentIndex(max(0, voice_mode_index))
+        self.voxcpm2_voice_mode_combo.currentIndexChanged.connect(self._on_voxcpm2_voice_mode_changed)
+        voice_form.addRow("Voice Mode:", self.voxcpm2_voice_mode_combo)
+
+        speaker_row = QHBoxLayout()
+        self.voxcpm2_speaker_combo = QComboBox()
+        self.voxcpm2_speaker_combo.addItem("Connect to server to load profiles...")
+        self.voxcpm2_speaker_combo.currentIndexChanged.connect(self._save_voxcpm2_settings)
+        speaker_row.addWidget(self.voxcpm2_speaker_combo)
+        btn_refresh_profiles = QPushButton("Refresh")
+        self._style_voxcpm2_button(btn_refresh_profiles, "#007bff", "#0056b3", 95)
+        btn_refresh_profiles.clicked.connect(self._refresh_voxcpm2_speaker_profiles)
+        speaker_row.addWidget(btn_refresh_profiles)
+        voice_form.addRow("Fallback / Single Voice:", speaker_row)
+
+        self.voxcpm2_voice_mode_note = QLabel()
+        self.voxcpm2_voice_mode_note.setWordWrap(True)
+        self.voxcpm2_voice_mode_note.setStyleSheet("color: #6c757d;")
+        voice_form.addRow(self.voxcpm2_voice_mode_note)
+
+        voice_group.setLayout(voice_form)
+        layout.addWidget(voice_group)
+        QTimer.singleShot(0, self._on_voxcpm2_voice_mode_changed)
+        QTimer.singleShot(250, self._refresh_voxcpm2_speaker_profiles)
+
+        advanced_group = QGroupBox("Generation Settings")
+        advanced_group.setFont(QFont("Segoe UI", 11, QFont.Bold))
+        advanced_form = QFormLayout()
+
+        self.voxcpm2_cfg_spin = QDoubleSpinBox()
+        self.voxcpm2_cfg_spin.setRange(1.0, 3.0)
+        self.voxcpm2_cfg_spin.setSingleStep(0.1)
+        self.voxcpm2_cfg_spin.setValue(float(self.app_settings.get("voxcpm2_cfg_value", 2.0)))
+        self.voxcpm2_cfg_spin.valueChanged.connect(self._save_voxcpm2_settings)
+        advanced_form.addRow("CFG Value:", self.voxcpm2_cfg_spin)
+
+        self.voxcpm2_control_input = QLineEdit(self.app_settings.get("voxcpm2_control_instruction", ""))
+        self.voxcpm2_control_input.setPlaceholderText("Optional: warm young woman, calm storyteller, dramatic voice...")
+        self.voxcpm2_control_input.editingFinished.connect(self._save_voxcpm2_settings)
+        advanced_form.addRow("Control Instruction:", self.voxcpm2_control_input)
+
+        self.voxcpm2_steps_spin = QSpinBox()
+        self.voxcpm2_steps_spin.setRange(1, 50)
+        self.voxcpm2_steps_spin.setValue(int(self.app_settings.get("voxcpm2_inference_steps", 10)))
+        self.voxcpm2_steps_spin.valueChanged.connect(self._save_voxcpm2_settings)
+        advanced_form.addRow("Inference Steps:", self.voxcpm2_steps_spin)
+
+        self.chk_voxcpm2_normalize = QCheckBox("Normalize text")
+        self.chk_voxcpm2_normalize.setChecked(self.app_settings.get("voxcpm2_normalize", False))
+        self.chk_voxcpm2_normalize.stateChanged.connect(self._save_voxcpm2_settings)
+        advanced_form.addRow(self.chk_voxcpm2_normalize)
+
+        self.chk_voxcpm2_denoise = QCheckBox("Denoise reference audio")
+        self.chk_voxcpm2_denoise.setChecked(self.app_settings.get("voxcpm2_denoise", False))
+        self.chk_voxcpm2_denoise.stateChanged.connect(self._save_voxcpm2_settings)
+        advanced_form.addRow(self.chk_voxcpm2_denoise)
+
+        advanced_group.setLayout(advanced_form)
+        layout.addWidget(advanced_group)
+
+        note = QLabel("For multiple characters, choose All Characters and leave Reference Audio empty. Add WAV files to the VoxCPM2 speakers folder using the exact table role name, for example: speakers/ប្រុស, ចាស់.wav. Selecting Reference Audio overrides the profile mode and forces one cloned voice.")
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #6c757d; padding: 12px; background-color: #f8f9fa; border-radius: 6px;")
+        layout.addWidget(note)
+        layout.addStretch()
+        return scroll
+
+    def _create_gemini_transcribe_page(self):
+        """Create Gemini media transcription settings page."""
+        scroll = self._create_page_container("Gemini Transcribe", "📝")
+        layout = scroll._page_layout
+
+        api_group = QGroupBox("Gemini API Keys (Failover Setup)")
+        api_group.setFont(QFont("Segoe UI", 11, QFont.Bold))
+        api_layout = QVBoxLayout()
+
+        api_note = QLabel("Add Gemini API keys one at a time. Keys are hidden and protected for this Windows account. If a key fails, the next key is tried automatically.")
+        api_note.setWordWrap(True)
+        api_note.setStyleSheet("color: #6c757d;")
+        api_layout.addWidget(api_note)
+
+        add_key_row = QHBoxLayout()
+        self.gemini_api_key_input = QLineEdit()
+        self.gemini_api_key_input.setPlaceholderText("Enter a Gemini API key...")
+        self.gemini_api_key_input.setEchoMode(QLineEdit.Password)
+        self.gemini_api_key_input.returnPressed.connect(self._add_gemini_api_key)
+        add_key_row.addWidget(self.gemini_api_key_input)
+        btn_add_key = QPushButton("Add")
+        self._style_voxcpm2_button(btn_add_key, "#007bff", "#0056b3", 80)
+        btn_add_key.clicked.connect(self._add_gemini_api_key)
+        add_key_row.addWidget(btn_add_key)
+        api_layout.addLayout(add_key_row)
+
+        self.gemini_api_keys_list = QListWidget()
+        self.gemini_api_keys_list.setFixedHeight(105)
+        api_layout.addWidget(self.gemini_api_keys_list)
+
+        key_actions = QHBoxLayout()
+        self.btn_toggle_gemini_keys = QPushButton("Show Keys")
+        self._style_voxcpm2_button(self.btn_toggle_gemini_keys, "#6c757d", "#545b62", 105)
+        self.btn_toggle_gemini_keys.clicked.connect(self._toggle_gemini_api_keys_visibility)
+        key_actions.addWidget(self.btn_toggle_gemini_keys)
+        btn_remove_key = QPushButton("Remove Selected")
+        self._style_voxcpm2_button(btn_remove_key, "#dc3545", "#bd2130", 155)
+        btn_remove_key.clicked.connect(self._remove_selected_gemini_api_key)
+        key_actions.addWidget(btn_remove_key)
+        key_actions.addStretch()
+        api_layout.addLayout(key_actions)
+        self._gemini_keys_visible = False
+        self._populate_gemini_api_keys_list(self._load_stored_gemini_api_keys())
+
+        self.gemini_model_combo = QComboBox()
+        self.gemini_model_combo.addItem("Gemini 3.5 Flash (alias: latest official Flash)", "gemini-3-flash-preview")
+        self.gemini_model_combo.addItem("Gemini 3 Flash Preview", "gemini-3-flash-preview")
+        self.gemini_model_combo.addItem("Gemini 2.5 Flash", "gemini-2.5-flash")
+        self.gemini_model_combo.addItem("Gemini 2.5 Flash Lite", "gemini-2.5-flash-lite")
+        saved_model = self.app_settings.get("gemini_transcribe_model", "gemini-3-flash-preview")
+        saved_index = self.gemini_model_combo.findData(saved_model)
+        self.gemini_model_combo.setCurrentIndex(max(0, saved_index))
+        self.gemini_model_combo.currentIndexChanged.connect(self._save_gemini_transcribe_settings)
+        api_layout.addWidget(QLabel("Gemini AI Model:"))
+        api_layout.addWidget(self.gemini_model_combo)
+
+        btn_save_keys = QPushButton("Save Gemini Settings")
+        self._style_voxcpm2_button(btn_save_keys, "#6c757d", "#545b62", 190)
+        btn_save_keys.clicked.connect(self._save_gemini_transcribe_settings)
+        api_layout.addWidget(btn_save_keys)
+        api_group.setLayout(api_layout)
+        layout.addWidget(api_group)
+
+        workflow_group = QGroupBox("3-Step Drama Transcribe Workflow")
+        workflow_group.setFont(QFont("Segoe UI", 11, QFont.Bold))
+        workflow_layout = QVBoxLayout()
+
+        media_row = QHBoxLayout()
+        self.gemini_media_path_input = QLineEdit(str(self.app_settings.get("gemini_transcribe_media_path", "")))
+        self.gemini_media_path_input.setPlaceholderText("Select source audio/video for Step 1...")
+        media_row.addWidget(self.gemini_media_path_input)
+        btn_browse_media = QPushButton("Browse Media")
+        self._style_voxcpm2_button(btn_browse_media, "#6c757d", "#545b62", 135)
+        btn_browse_media.clicked.connect(self._browse_gemini_media)
+        media_row.addWidget(btn_browse_media)
+        workflow_layout.addLayout(media_row)
+
+        step_note = QLabel(
+            "Step 1 creates an original-language SRT with tight speech timestamps. "
+            "Step 2 lets you label speakers and relationships. Step 3 translates Khmer using those character rules."
+        )
+        step_note.setWordWrap(True)
+        step_note.setStyleSheet("color: #495057; padding: 10px; background-color: #eef6ff; border-radius: 6px;")
+        workflow_layout.addWidget(step_note)
+
+        step_buttons = QHBoxLayout()
+        self.btn_gemini_transcribe = QPushButton("1. Transcribe + Timestamps")
+        self._style_voxcpm2_button(self.btn_gemini_transcribe, "#2563eb", "#1d4ed8", 205)
+        self.btn_gemini_transcribe.clicked.connect(self._start_gemini_transcribe)
+        step_buttons.addWidget(self.btn_gemini_transcribe)
+
+        self.btn_scan_character_profiles = QPushButton("2. Scan Speakers")
+        self._style_voxcpm2_button(self.btn_scan_character_profiles, "#f59e0b", "#d97706", 155)
+        self.btn_scan_character_profiles.clicked.connect(self._scan_character_profiles_from_table)
+        step_buttons.addWidget(self.btn_scan_character_profiles)
+
+        self.btn_gemini_translate_profiles = QPushButton("3. Translate with Profiles")
+        self._style_voxcpm2_button(self.btn_gemini_translate_profiles, "#16a34a", "#15803d", 205)
+        self.btn_gemini_translate_profiles.clicked.connect(self._start_gemini_translate_stage3)
+        step_buttons.addWidget(self.btn_gemini_translate_profiles)
+        step_buttons.addStretch()
+        workflow_layout.addLayout(step_buttons)
+
+        self.character_profiles_table = QTableWidget(0, 6)
+        self.character_profiles_table.setHorizontalHeaderLabels([
+            "Speaker Label", "Character Name", "Gender", "Age", "Relationship", "Khmer Address Rule"
+        ])
+        self.character_profiles_table.setMinimumHeight(170)
+        self.character_profiles_table.horizontalHeader().setStretchLastSection(True)
+        self.character_profiles_table.setAlternatingRowColors(True)
+        workflow_layout.addWidget(self.character_profiles_table)
+
+        workflow_group.setLayout(workflow_layout)
+        layout.addWidget(workflow_group)
+
+        guidance_group = QGroupBox("Contextual Khmer Translation")
+        guidance_group.setFont(QFont("Segoe UI", 11, QFont.Bold))
+        guidance_form = QFormLayout()
+        self.gemini_prompt_input = QTextEdit()
+        self.gemini_prompt_input.setFixedHeight(105)
+        saved_guidance = self.app_settings.get("gemini_transcribe_prompt", "")
+        if not saved_guidance or str(saved_guidance).startswith("Transcribe this media accurately."):
+            saved_guidance = (
+                "Read the complete original transcript before translating. Understand the story, character identities, "
+                "relationships, honorifics, emotional context, and who is speaking to whom. Translate naturally into Khmer "
+                "for a drama audience. Preserve every SRT timestamp and subtitle number exactly. Keep speaker labels in Khmer. "
+                "Return only valid Khmer SRT subtitles."
+            )
+        self.gemini_prompt_input.setPlainText(str(saved_guidance))
+        guidance_form.addRow("Translation Guidance:", self.gemini_prompt_input)
+
+        self.gemini_transcribe_status = QLabel("Ready")
+        self.gemini_transcribe_status.setStyleSheet("color: #6c757d; font-weight: bold;")
+        guidance_form.addRow("Status:", self.gemini_transcribe_status)
+
+        usage_note = QLabel("Open a video on the Home page, then click Gemini SRT. The translated Khmer subtitles will be loaded into the table automatically.")
+        usage_note.setWordWrap(True)
+        usage_note.setStyleSheet("color: #6c757d; padding: 10px; background-color: #f8f9fa; border-radius: 6px;")
+        guidance_form.addRow(usage_note)
+
+        guidance_group.setLayout(guidance_form)
+        layout.addWidget(guidance_group)
+        layout.addStretch()
+        return scroll
+
     def _create_config_page(self):
         """Create Configuration page"""
         scroll = self._create_page_container("Configuration Management (ការកំណត់)", "⚙️")
         layout = scroll._page_layout
+
+        dubbing_group = QGroupBox("Dubbing Settings (ការកំណត់សំឡេង)")
+        dubbing_group.setFont(QFont("Segoe UI", 11, QFont.Bold))
+        dubbing_layout = QFormLayout()
+
+        btn_open_tts_config = QPushButton("⚙ Open Character Config")
+        btn_open_tts_config.setFixedHeight(42)
+        btn_open_tts_config.clicked.connect(self.open_tts_config)
+        btn_open_tts_config.setCursor(Qt.PointingHandCursor)  # type: ignore[attr-defined]
+        btn_open_tts_config.setStyleSheet("""
+            QPushButton {
+                background-color: #1f2937;
+                color: white;
+                font-size: 10pt;
+                font-weight: bold;
+                border-radius: 6px;
+                padding: 8px 12px;
+            }
+            QPushButton:hover {
+                background-color: #111827;
+            }
+        """)
+        dubbing_layout.addRow("Character voices:", btn_open_tts_config)
+
+        if hasattr(self, "chk_auto_fit"):
+            self.chk_auto_fit.setText("Auto-Fit generated audio to each SRT segment")
+            dubbing_layout.addRow("Timing:", self.chk_auto_fit)
+
+        dubbing_group.setLayout(dubbing_layout)
+        layout.addWidget(dubbing_group)
 
         # Theme Selector Section
         theme_group = QGroupBox("🎨 Theme Selection (ជ្រើសរើស Theme)") # type: ignore
@@ -4152,8 +5871,11 @@ class MainWindow(QMainWindow):
         form.addRow("Status:", self.license_status_label)
 
         config = load_online_license_config()
-        online_text = "Enabled" if online_license_is_enabled(config) else "Not configured"
-        self.license_server_label = QLabel(f"{online_text} - {config.get('api_base_url') or 'No server URL'}")
+        if online_license_is_enabled(config):
+            server_text = f"Enabled - {config.get('api_base_url')}"
+        else:
+            server_text = "Not configured"
+        self.license_server_label = QLabel(server_text)
         self.license_server_label.setWordWrap(True)
         self.license_server_label.setStyleSheet("color: #6c757d;")
         form.addRow("Online Server:", self.license_server_label)
@@ -4223,7 +5945,7 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 return False, f"Could not read saved offline license: {e}"
 
-        return False, "No registered license found. Trial mode may still be active."
+        return False, "No registered license found."
 
     def refresh_license_page_status(self):
         if not hasattr(self, "license_status_label"):
@@ -4609,7 +6331,7 @@ class MainWindow(QMainWindow):
         if not re.match(r"^https?://", url, re.IGNORECASE):
             url = "https://" + url
 
-        opened = QDesktopServices.openUrl(QUrl(url))
+        opened = self.open_external_url(url)
         if opened:
             self.app_settings["update_url"] = url
             self.save_app_settings()
@@ -4945,6 +6667,1503 @@ class MainWindow(QMainWindow):
     # Professional Settings Helpers
     # =============================
 
+    def _style_voxcpm2_button(self, button: QPushButton, color: str, hover_color: str, width: int) -> None:
+        """Keep VoxCPM2 actions visible across application themes."""
+        button.setFixedSize(width, 42)
+        button.setCursor(Qt.PointingHandCursor)  # type: ignore[attr-defined]
+        button.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {color};
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 8px 12px;
+                font-size: 10pt;
+                font-weight: bold;
+            }}
+            QPushButton:hover {{
+                background-color: {hover_color};
+            }}
+            QPushButton:pressed {{
+                background-color: {hover_color};
+            }}
+        """)
+
+    def _save_voxcpm2_settings(self) -> None:
+        """Persist VoxCPM2 controls when the settings page is available."""
+        if not hasattr(self, "chk_voxcpm2_enabled"):
+            if hasattr(self, "home_voxcpm2_voice_mode_combo"):
+                self.app_settings["voxcpm2_voice_mode"] = self.home_voxcpm2_voice_mode_combo.currentData()
+            if hasattr(self, "home_voxcpm2_speaker_combo"):
+                self.app_settings["voxcpm2_default_speaker"] = self.home_voxcpm2_speaker_combo.currentText().strip()
+            self.save_app_settings()
+            return
+        self.app_settings.update({
+            "voxcpm2_enabled": self.chk_voxcpm2_enabled.isChecked(),
+            "voxcpm2_autostart": self.chk_voxcpm2_autostart.isChecked(),
+            "voxcpm2_stop_on_close": self.chk_voxcpm2_stop_on_close.isChecked(),
+            "voxcpm2_url": self._get_voxcpm2_url(),
+            "voxcpm2_server_path": self.voxcpm2_server_path_input.text().strip(),
+            "voxcpm2_reference_audio": self.voxcpm2_reference_input.text().strip(),
+            "voxcpm2_voice_mode": self.voxcpm2_voice_mode_combo.currentData() if hasattr(self, "voxcpm2_voice_mode_combo") else "all",
+            "voxcpm2_default_speaker": self.voxcpm2_speaker_combo.currentText().strip() if hasattr(self, "voxcpm2_speaker_combo") else "",
+            "voxcpm2_cfg_value": self.voxcpm2_cfg_spin.value(),
+            "voxcpm2_control_instruction": self.voxcpm2_control_input.text().strip(),
+            "voxcpm2_inference_steps": self.voxcpm2_steps_spin.value(),
+            "voxcpm2_normalize": self.chk_voxcpm2_normalize.isChecked(),
+            "voxcpm2_denoise": self.chk_voxcpm2_denoise.isChecked(),
+        })
+        if hasattr(self, "home_tts_engine_combo"):
+            self.home_tts_engine_combo.blockSignals(True)
+            self.home_tts_engine_combo.setCurrentIndex(1 if self.chk_voxcpm2_enabled.isChecked() else 0)
+            self.home_tts_engine_combo.blockSignals(False)
+        self._sync_home_voxcpm2_controls()
+        self.save_app_settings()
+
+    def _get_voxcpm2_url(self) -> str:
+        if hasattr(self, "voxcpm2_url_input"):
+            url = self.voxcpm2_url_input.text().strip()
+        else:
+            url = str(self.app_settings.get("voxcpm2_url", DEFAULT_VOXCPM2_URL)).strip()
+        return (url or DEFAULT_VOXCPM2_URL).rstrip("/")
+
+    def _browse_voxcpm2_server_path(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select VoxCPM2 Server App", "", "Server App (*.py *.bat *.cmd *.exe);;All Files (*)"
+        )
+        if path:
+            self.voxcpm2_server_path_input.setText(path)
+            self._save_voxcpm2_settings()
+
+    def _browse_voxcpm2_reference_audio(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select VoxCPM2 Reference Audio", "", "Audio Files (*.wav *.mp3 *.flac *.m4a);;All Files (*)"
+        )
+        if path:
+            self.voxcpm2_reference_input.setText(path)
+            self._save_voxcpm2_settings()
+
+    def _set_voxcpm2_status(self, text: str, color: str) -> None:
+        if hasattr(self, "voxcpm2_status_label"):
+            self.voxcpm2_status_label.setText(text)
+            self.voxcpm2_status_label.setStyleSheet(f"color: {color}; font-weight: bold;")
+
+    def _on_voxcpm2_voice_mode_changed(self) -> None:
+        if not hasattr(self, "voxcpm2_voice_mode_combo"):
+            return
+        use_single_voice = self.voxcpm2_voice_mode_combo.currentData() == "single"
+        if hasattr(self, "voxcpm2_speaker_combo"):
+            self.voxcpm2_speaker_combo.setEnabled(True)
+        if hasattr(self, "voxcpm2_voice_mode_note"):
+            if use_single_voice:
+                self.voxcpm2_voice_mode_note.setText("Every subtitle row will use the selected voice profile.")
+            else:
+                self.voxcpm2_voice_mode_note.setText(
+                    "Each table role is matched to a WAV profile with the same name. "
+                    "The selected profile is used only when a role has no matching WAV file."
+                )
+        self._save_voxcpm2_settings()
+
+    def _get_voxcpm2_speaker_choices(self) -> list[str]:
+        try:
+            info = self._voxcpm2_json_request(f"{self._get_voxcpm2_url()}/gradio_api/info", timeout=5.0)
+            endpoint = info.get("named_endpoints", {}).get("/generate_srt_voice", {})
+            for parameter in endpoint.get("parameters", []):
+                if parameter.get("parameter_name") == "default_speaker":
+                    return [str(choice) for choice in parameter.get("type", {}).get("enum", [])]
+        except Exception:
+            pass
+        return []
+
+    def _refresh_voxcpm2_speaker_profiles(self) -> None:
+        if not hasattr(self, "voxcpm2_speaker_combo") and not hasattr(self, "home_voxcpm2_speaker_combo"):
+            return
+        choices = self._get_voxcpm2_speaker_choices()
+        if not choices:
+            return
+        selected = str(self.app_settings.get("voxcpm2_default_speaker", "")).strip()
+        final_selection = selected if selected in choices else choices[0]
+        if hasattr(self, "voxcpm2_speaker_combo"):
+            self.voxcpm2_speaker_combo.blockSignals(True)
+            self.voxcpm2_speaker_combo.clear()
+            self.voxcpm2_speaker_combo.addItems(choices)
+            self.voxcpm2_speaker_combo.setCurrentText(final_selection)
+            self.voxcpm2_speaker_combo.blockSignals(False)
+        if hasattr(self, "home_voxcpm2_speaker_combo"):
+            self.home_voxcpm2_speaker_combo.blockSignals(True)
+            self.home_voxcpm2_speaker_combo.clear()
+            self.home_voxcpm2_speaker_combo.addItems(choices)
+            self.home_voxcpm2_speaker_combo.setCurrentText(final_selection)
+            self.home_voxcpm2_speaker_combo.blockSignals(False)
+        self.app_settings["voxcpm2_default_speaker"] = final_selection
+        self._save_voxcpm2_settings()
+
+    def _is_voxcpm2_server_online(self, timeout: float = 3.0) -> bool:
+        request = urllib.request.Request(self._get_voxcpm2_url(), method="GET")
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return 200 <= response.status < 500
+
+    def _test_voxcpm2_connection(self) -> None:
+        self._save_voxcpm2_settings()
+        try:
+            if self._is_voxcpm2_server_online():
+                self._refresh_voxcpm2_speaker_profiles()
+                self._set_voxcpm2_status("Connected", "#28a745")
+                self.log(f"✅ VoxCPM2 server connected: {self._get_voxcpm2_url()}")
+                QMessageBox.information(self, "VoxCPM2 AI", "Connected to the VoxCPM2 server successfully.")
+                return
+        except Exception as e:
+            self.log(f"⚠️ VoxCPM2 connection failed: {e}")
+        self._set_voxcpm2_status("Connection failed", "#dc3545")
+        QMessageBox.warning(self, "VoxCPM2 AI", f"Could not connect to:\n{self._get_voxcpm2_url()}")
+
+    def _start_voxcpm2_server(self, silent: bool = False) -> None:
+        path = self.app_settings.get("voxcpm2_server_path", "")
+        if hasattr(self, "voxcpm2_server_path_input"):
+            path = self.voxcpm2_server_path_input.text().strip()
+            self._save_voxcpm2_settings()
+        if not path or not os.path.exists(path):
+            if not silent:
+                QMessageBox.warning(self, "VoxCPM2 AI", "Select the VoxCPM2 server app path first.")
+            return
+        try:
+            if self._is_voxcpm2_server_online(timeout=1.0):
+                self._set_voxcpm2_status("Already running", "#28a745")
+                return
+        except Exception:
+            pass
+        try:
+            extension = os.path.splitext(path)[1].lower()
+            if extension == ".py":
+                python_cmd = self._python_command()
+                if not python_cmd:
+                    raise RuntimeError("Python is required to launch the VoxCPM2 server.")
+                command = [*python_cmd, path]
+            elif extension in (".bat", ".cmd"):
+                command = ["cmd.exe", "/c", path]
+            else:
+                command = [path]
+            self.voxcpm2_server_process = subprocess.Popen(
+                command,
+                cwd=os.path.dirname(path),
+                env=self._external_process_env(),
+                creationflags=self._subprocess_creation_flags(),
+            )
+            self._set_voxcpm2_status("Starting...", "#ffc107")
+            self.log(f"🚀 Starting VoxCPM2 server: {path}")
+        except Exception as e:
+            self._set_voxcpm2_status("Start failed", "#dc3545")
+            self.log(f"❌ Could not start VoxCPM2 server: {e}")
+            if not silent:
+                QMessageBox.warning(self, "VoxCPM2 AI", f"Could not start server:\n{e}")
+
+    def _get_voxcpm2_listener_pid(self) -> Optional[int]:
+        """Return the PID listening on the configured local VoxCPM2 port."""
+        parsed = urllib.parse.urlparse(self._get_voxcpm2_url())
+        if parsed.hostname not in ("127.0.0.1", "localhost", "::1") or not parsed.port:
+            return None
+        if sys.platform != "win32":
+            return None
+        try:
+            command = (
+                f"(Get-NetTCPConnection -LocalPort {parsed.port} -State Listen "
+                "-ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty OwningProcess)"
+            )
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", command],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                creationflags=self._subprocess_creation_flags(),
+            )
+            return int(result.stdout.strip()) if result.stdout.strip().isdigit() else None
+        except Exception:
+            return None
+
+    def _stop_voxcpm2_server(self, silent: bool = False) -> None:
+        """Stop the configured local VoxCPM2 server and its child processes."""
+        pid = self._get_voxcpm2_listener_pid()
+        launched_process = getattr(self, "voxcpm2_server_process", None)
+        if not pid and launched_process is not None and launched_process.poll() is None:
+            pid = launched_process.pid
+        if not pid:
+            self.voxcpm2_server_process = None
+            self._set_voxcpm2_status("Not running", "#6c757d")
+            if not silent:
+                QMessageBox.information(self, "VoxCPM2 AI", "The VoxCPM2 server is not running.")
+            return
+        try:
+            if sys.platform == "win32":
+                result = subprocess.run(
+                    ["taskkill", "/PID", str(pid), "/T", "/F"],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                    creationflags=self._subprocess_creation_flags(),
+                )
+                if result.returncode != 0:
+                    raise RuntimeError(result.stderr.strip() or result.stdout.strip())
+            else:
+                os.kill(pid, 15)
+            for _ in range(10):
+                if not self._get_voxcpm2_listener_pid():
+                    break
+                time.sleep(0.3)
+            self._set_voxcpm2_status("Stopped", "#6c757d")
+            self.log(f"🛑 VoxCPM2 server stopped (PID {pid})")
+            if not silent:
+                QMessageBox.information(self, "VoxCPM2 AI", "VoxCPM2 server stopped.")
+        except Exception as e:
+            self._set_voxcpm2_status("Stop failed", "#dc3545")
+            self.log(f"❌ Could not stop VoxCPM2 server: {e}")
+            if not silent:
+                QMessageBox.warning(self, "VoxCPM2 AI", f"Could not stop server:\n{e}")
+        finally:
+            self.voxcpm2_server_process = None
+
+    def _save_gemini_transcribe_settings(self) -> None:
+        """Persist Gemini transcription settings locally."""
+        if not hasattr(self, "gemini_api_keys_list"):
+            return
+        self.app_settings.update({
+            "gemini_transcribe_model": self.gemini_model_combo.currentData(),
+            "gemini_transcribe_prompt": self.gemini_prompt_input.toPlainText().strip(),
+        })
+        if hasattr(self, "gemini_media_path_input"):
+            self.app_settings["gemini_transcribe_media_path"] = self.gemini_media_path_input.text().strip()
+        if hasattr(self, "character_profiles_table"):
+            self._save_character_profiles_to_role_configs()
+        self._store_gemini_api_keys(self._get_gemini_api_keys())
+        self.save_app_settings()
+
+    def _mask_gemini_api_key(self, api_key: str) -> str:
+        if len(api_key) <= 10:
+            return "*" * len(api_key)
+        return f"{api_key[:5]}{'*' * 14}{api_key[-4:]}"
+
+    def _get_gemini_api_keys(self) -> list[str]:
+        if not hasattr(self, "gemini_api_keys_list"):
+            return self._load_stored_gemini_api_keys()
+        keys = []
+        for index in range(self.gemini_api_keys_list.count()):
+            key = self.gemini_api_keys_list.item(index).data(QT_USER_ROLE)
+            if key:
+                keys.append(str(key))
+        return keys
+
+    def _populate_gemini_api_keys_list(self, keys: list[str]) -> None:
+        self.gemini_api_keys_list.clear()
+        for index, key in enumerate(keys, start=1):
+            label = key if getattr(self, "_gemini_keys_visible", False) else self._mask_gemini_api_key(key)
+            item = QListWidgetItem(f"Key {index}: {label}")
+            item.setData(QT_USER_ROLE, key)
+            self.gemini_api_keys_list.addItem(item)
+
+    def _add_gemini_api_key(self) -> None:
+        key = self.gemini_api_key_input.text().strip()
+        if not key:
+            return
+        keys = self._get_gemini_api_keys()
+        if key not in keys:
+            keys.append(key)
+        self.gemini_api_key_input.clear()
+        self._populate_gemini_api_keys_list(keys)
+        self._save_gemini_transcribe_settings()
+
+    def _remove_selected_gemini_api_key(self) -> None:
+        row = self.gemini_api_keys_list.currentRow()
+        if row < 0:
+            return
+        keys = self._get_gemini_api_keys()
+        del keys[row]
+        self._populate_gemini_api_keys_list(keys)
+        self._save_gemini_transcribe_settings()
+
+    def _toggle_gemini_api_keys_visibility(self) -> None:
+        self._gemini_keys_visible = not self._gemini_keys_visible
+        self.btn_toggle_gemini_keys.setText("Hide Keys" if self._gemini_keys_visible else "Show Keys")
+        self._populate_gemini_api_keys_list(self._get_gemini_api_keys())
+
+    def _speaker_labels_from_text(self, text: str) -> list[str]:
+        labels = []
+        for match in re.finditer(r"^\s*\[([^\]]+)\]", text or "", flags=re.MULTILINE):
+            label = normalize_role_name(match.group(1).strip())
+            if label and label not in labels:
+                labels.append(label)
+        return labels
+
+    def _speaker_labels_from_table(self) -> list[str]:
+        labels = []
+        if not hasattr(self, "segment_table"):
+            return labels
+        for row in range(self.segment_table.rowCount()):
+            combo = self.segment_table.cellWidget(row, 3)
+            label = normalize_role_name(combo.currentText().strip()) if isinstance(combo, QComboBox) else ""
+            if label and label not in labels:
+                labels.append(label)
+        return labels
+
+    def _scan_character_profiles_from_table(self) -> None:
+        labels = self._speaker_labels_from_table()
+        if not labels and self.gemini_original_srt:
+            labels = self._speaker_labels_from_text(self.gemini_original_srt)
+        if not labels:
+            QMessageBox.information(self, "Character Profiles", "No speaker labels found yet. Run Step 1 or load an SRT with [Speaker] labels first.")
+            return
+        self._populate_character_profiles_table(labels)
+        self.log(f"🎭 Step 2: scanned {len(labels)} speaker profiles.")
+
+    def _populate_character_profiles_table(self, labels: list[str]) -> None:
+        if not hasattr(self, "character_profiles_table"):
+            return
+        self.character_profiles_table.setRowCount(0)
+        for label in labels:
+            row = self.character_profiles_table.rowCount()
+            self.character_profiles_table.insertRow(row)
+            config = self.role_configs.get(label, {})
+            values = [
+                label,
+                str(config.get("display_name", label if not label.lower().startswith("speaker") else "")),
+                str(config.get("gender", config.get("sex", ""))),
+                str(config.get("age", "")),
+                str(config.get("relationship", "")),
+                str(config.get("address_rule", "")),
+            ]
+            for col, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if col == 0:
+                    item.setFlags(item.flags() & ~QT_ITEM_IS_EDITABLE)
+                self.character_profiles_table.setItem(row, col, item)
+        self.character_profiles_table.resizeColumnsToContents()
+
+    def _character_profiles_from_table(self) -> list[dict[str, str]]:
+        profiles = []
+        if not hasattr(self, "character_profiles_table"):
+            return profiles
+        for row in range(self.character_profiles_table.rowCount()):
+            def cell(col: int) -> str:
+                item = self.character_profiles_table.item(row, col)
+                return item.text().strip() if item else ""
+            label = cell(0)
+            if not label:
+                continue
+            profiles.append({
+                "speaker": label,
+                "name": cell(1),
+                "gender": cell(2),
+                "age": cell(3),
+                "relationship": cell(4),
+                "address_rule": cell(5),
+            })
+        return profiles
+
+    def _save_character_profiles_to_role_configs(self) -> None:
+        for profile in self._character_profiles_from_table():
+            role = profile["speaker"]
+            if not role:
+                continue
+            config = self.role_configs.setdefault(role, {})
+            config["display_name"] = profile.get("name", "")
+            config["gender"] = profile.get("gender", "")
+            config["age"] = profile.get("age", config.get("age", ""))
+            config["relationship"] = profile.get("relationship", "")
+            config["address_rule"] = profile.get("address_rule", "")
+            config["is_new"] = False
+
+    def _character_profiles_context(self) -> str:
+        profiles = self._character_profiles_from_table()
+        if not profiles:
+            return "No user-confirmed character profiles were provided."
+        lines = []
+        for profile in profiles:
+            lines.append(
+                f"- {profile['speaker']}: name={profile.get('name') or 'unknown'}, "
+                f"gender={profile.get('gender') or 'unknown'}, age={profile.get('age') or 'unknown'}, "
+                f"relationship={profile.get('relationship') or 'unspecified'}, "
+                f"Khmer address rule={profile.get('address_rule') or 'infer carefully'}"
+            )
+        return "\n".join(lines)
+
+    def _protect_windows_data(self, value: str) -> str:
+        """Protect a secret with Windows DPAPI for the current user account."""
+        if sys.platform != "win32":
+            return base64.b64encode(value.encode("utf-8")).decode("ascii")
+
+        class DataBlob(ctypes.Structure):
+            _fields_ = [("cbData", ctypes.c_ulong), ("pbData", ctypes.POINTER(ctypes.c_ubyte))]
+
+        raw = value.encode("utf-8")
+        raw_buffer = ctypes.create_string_buffer(raw)
+        input_blob = DataBlob(len(raw), ctypes.cast(raw_buffer, ctypes.POINTER(ctypes.c_ubyte)))
+        output_blob = DataBlob()
+        if not ctypes.windll.crypt32.CryptProtectData(
+            ctypes.byref(input_blob), None, None, None, None, 0, ctypes.byref(output_blob)
+        ):
+            raise ctypes.WinError()
+        try:
+            encrypted = ctypes.string_at(output_blob.pbData, output_blob.cbData)
+            return base64.b64encode(encrypted).decode("ascii")
+        finally:
+            ctypes.windll.kernel32.LocalFree(output_blob.pbData)
+
+    def _unprotect_windows_data(self, value: str) -> str:
+        """Decrypt a DPAPI-protected secret for the current user account."""
+        encrypted = base64.b64decode(value.encode("ascii"))
+        if sys.platform != "win32":
+            return encrypted.decode("utf-8")
+
+        class DataBlob(ctypes.Structure):
+            _fields_ = [("cbData", ctypes.c_ulong), ("pbData", ctypes.POINTER(ctypes.c_ubyte))]
+
+        encrypted_buffer = ctypes.create_string_buffer(encrypted)
+        input_blob = DataBlob(len(encrypted), ctypes.cast(encrypted_buffer, ctypes.POINTER(ctypes.c_ubyte)))
+        output_blob = DataBlob()
+        if not ctypes.windll.crypt32.CryptUnprotectData(
+            ctypes.byref(input_blob), None, None, None, None, 0, ctypes.byref(output_blob)
+        ):
+            raise ctypes.WinError()
+        try:
+            return ctypes.string_at(output_blob.pbData, output_blob.cbData).decode("utf-8")
+        finally:
+            ctypes.windll.kernel32.LocalFree(output_blob.pbData)
+
+    def _load_stored_gemini_api_keys(self) -> list[str]:
+        keys = []
+        protected = self.app_settings.get("gemini_api_keys_protected", [])
+        if isinstance(protected, list):
+            for encrypted_key in protected:
+                try:
+                    key = self._unprotect_windows_data(str(encrypted_key)).strip()
+                    if key and key not in keys:
+                        keys.append(key)
+                except Exception:
+                    pass
+        legacy = self.app_settings.pop("gemini_api_keys", "")
+        if isinstance(legacy, str):
+            for key in legacy.splitlines():
+                key = key.strip()
+                if key and key not in keys:
+                    keys.append(key)
+        if legacy:
+            self._store_gemini_api_keys(keys)
+            self.save_app_settings()
+        return keys
+
+    def _store_gemini_api_keys(self, keys: list[str]) -> None:
+        self.app_settings.pop("gemini_api_keys", None)
+        self.app_settings["gemini_api_keys_protected"] = [self._protect_windows_data(key) for key in keys]
+
+    def _browse_gemini_media(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Audio or Video for Gemini Transcription",
+            self.app_settings.get("last_video_dir", ""),
+            "Media Files (*.mp3 *.wav *.m4a *.aac *.flac *.mp4 *.mkv *.mov *.avi *.webm);;All Files (*)",
+        )
+        if path:
+            self.app_settings["gemini_transcribe_media_path"] = path
+            if hasattr(self, "gemini_media_path_input"):
+                self.gemini_media_path_input.setText(path)
+            self._save_gemini_transcribe_settings()
+
+    def _start_gemini_transcribe(self) -> None:
+        self._save_gemini_transcribe_settings()
+        keys = self._get_gemini_api_keys()
+        media_path = self.gemini_media_path_input.text().strip() if hasattr(self, "gemini_media_path_input") else str(self.app_settings.get("gemini_transcribe_media_path", ""))
+        self._start_gemini_transcribe_job(keys, media_path, import_to_table=True, translate_after=False)
+
+    def _start_home_gemini_transcribe(self) -> None:
+        """Transcribe the opened video, translate to Khmer, and populate the Home subtitle table."""
+        keys = self._get_gemini_api_keys()
+        media_path = self.current_video_path if self.current_video_path and os.path.exists(self.current_video_path) else ""
+        if not media_path:
+            media_path, _ = QFileDialog.getOpenFileName(
+                self,
+                "Select Audio or Video for Gemini Transcription",
+                self.app_settings.get("last_video_dir", ""),
+                "Media Files (*.mp3 *.wav *.m4a *.aac *.flac *.mp4 *.mkv *.mov *.avi *.webm);;All Files (*)",
+            )
+        self._start_gemini_transcribe_job(keys, media_path, import_to_table=True, translate_after=True)
+
+    def _start_gemini_transcribe_job(self, keys: list[str], media_path: str, import_to_table: bool, translate_after: bool = False) -> None:
+        """Start a Gemini transcription from Settings or the Home shortcut."""
+        if not keys:
+            QMessageBox.warning(self, "Gemini Transcribe", "Enter at least one Gemini API key in Settings > Gemini Transcribe.")
+            return
+        if not media_path or not os.path.exists(media_path):
+            QMessageBox.warning(self, "Gemini Transcribe", "Select an existing audio or video file.")
+            return
+        self.app_settings["gemini_transcribe_media_path"] = media_path
+        self.save_app_settings()
+        self._clear_generated_audio_state()
+        self.stop_event.clear()
+        self._gemini_import_to_table = import_to_table
+        self._gemini_one_click_khmer = bool(translate_after and import_to_table)
+        self._gemini_transcribe_media_path = media_path
+        if hasattr(self, "btn_gemini_transcribe"):
+            self.btn_gemini_transcribe.setEnabled(False)
+        if hasattr(self, "btn_gemini_translate_profiles"):
+            self.btn_gemini_translate_profiles.setEnabled(False)
+        if hasattr(self, "btn_timeline_transcribe"):
+            self.btn_timeline_transcribe.setEnabled(False)
+        if hasattr(self, "btn_timeline_translate"):
+            self.btn_timeline_translate.setEnabled(False)
+        if hasattr(self, "btn_home_gemini_transcribe"):
+            self.btn_home_gemini_transcribe.setEnabled(False)
+        self.gemini_transcribe_status.setText("Uploading media and transcribing..." if not translate_after else "Uploading media, transcribing, and translating Khmer...")
+        self.gemini_transcribe_status.setStyleSheet("color: #007bff; font-weight: bold;")
+        if translate_after:
+            self.log(f"📝 Gemini Transcribe Khmer workflow started: {os.path.basename(media_path)}")
+        else:
+            self.log(f"📝 Gemini Transcribe started: {os.path.basename(media_path)}")
+        self._set_gemini_progress_stage("Gemini SRT: preparing media...")
+        self.start_worker_thread(
+            target=self._run_gemini_transcribe_thread,
+            args=(keys, media_path, str(self.gemini_model_combo.currentData()), self.gemini_prompt_input.toPlainText().strip(), translate_after),
+        )
+
+    def _set_gemini_progress_stage(self, stage: str) -> None:
+        """Show an indeterminate Home progress animation while Gemini is working."""
+        if stage:
+            self._gemini_progress_active = True
+            self._show_transcribe_table_overlay(stage)
+            if hasattr(self, "btn_stop_gemini_transcribe"):
+                self.btn_stop_gemini_transcribe.setVisible(True)
+                self.btn_stop_gemini_transcribe.setEnabled(True)
+            if hasattr(self, "progress"):
+                self.progress.setVisible(False)
+            self.progress.setRange(0, 0)
+            self.progress.setFormat(stage)
+            self.gemini_home_status.setText(stage)
+            self.gemini_home_status.setStyleSheet("color: #007bff; font-weight: bold;")
+            self.gemini_home_status.setVisible(True)
+            if hasattr(self, "btn_home_gemini_transcribe"):
+                self.btn_home_gemini_transcribe.setText("Gemini SRT")
+                self.btn_home_gemini_transcribe.setToolTip(stage)
+            is_translate_stage = "translat" in stage.lower()
+            if hasattr(self, "btn_timeline_transcribe") and not is_translate_stage:
+                self.btn_timeline_transcribe.setText("Transcribing")
+            if hasattr(self, "btn_timeline_translate") and is_translate_stage:
+                self.btn_timeline_translate.setText("Translating")
+            if hasattr(self, "btn_timeline_capcut_video_translate") and "capcut" in stage.lower():
+                self.btn_timeline_capcut_video_translate.setText("CapCut + Video")
+            if hasattr(self, "gemini_transcribe_status"):
+                self.gemini_transcribe_status.setText(stage)
+                self.gemini_transcribe_status.setStyleSheet("color: #007bff; font-weight: bold;")
+            QApplication.processEvents()
+            return
+        self._gemini_progress_active = False
+        self._hide_transcribe_table_overlay()
+        if hasattr(self, "btn_stop_gemini_transcribe"):
+            self.btn_stop_gemini_transcribe.setVisible(False)
+            self.btn_stop_gemini_transcribe.setEnabled(False)
+        if hasattr(self, "progress"):
+            self.progress.setVisible(True)
+        self.progress.setRange(0, 100)
+        self.progress.setFormat("%p%")
+        if hasattr(self, "btn_home_gemini_transcribe"):
+            self.btn_home_gemini_transcribe.setText("Gemini SRT")
+            self.btn_home_gemini_transcribe.setToolTip("Transcribe the opened video with Gemini and load subtitles into the table")
+        if hasattr(self, "btn_timeline_transcribe"):
+            self.btn_timeline_transcribe.setText("Transcribe Khmer")
+        if hasattr(self, "btn_timeline_translate"):
+            self.btn_timeline_translate.setText("Translate Khmer")
+        if hasattr(self, "btn_timeline_capcut_video_translate"):
+            self.btn_timeline_capcut_video_translate.setText("CapCut + Video")
+
+    def _stop_gemini_job(self) -> None:
+        self.stop_event.set()
+        if hasattr(self, "btn_stop_gemini_transcribe"):
+            self.btn_stop_gemini_transcribe.setEnabled(False)
+        self._show_transcribe_table_overlay("កំពុងបញ្ឈប់ Transcribe...")
+        if hasattr(self, "gemini_transcribe_status"):
+            self.gemini_transcribe_status.setText("Stopping Gemini job...")
+            self.gemini_transcribe_status.setStyleSheet("color: #dc3545; font-weight: bold;")
+        self.log("🛑 Stop requested for Gemini transcribe/translate job.")
+
+    def _hide_gemini_home_status(self) -> None:
+        if hasattr(self, "gemini_home_status") and not getattr(self, "_gemini_progress_active", False):
+            self.gemini_home_status.setVisible(False)
+
+    def _gemini_request(
+        self,
+        url: str,
+        payload: Optional[dict[str, Any]] = None,
+        headers: Optional[dict[str, str]] = None,
+        method: Optional[str] = None,
+        data: Optional[bytes] = None,
+        timeout: float = 120.0,
+    ) -> tuple[Any, Any]:
+        body = data
+        request_headers = dict(headers or {})
+        if payload is not None:
+            body = json.dumps(payload).encode("utf-8")
+            request_headers.setdefault("Content-Type", "application/json")
+        request = urllib.request.Request(url, data=body, headers=request_headers, method=method or ("POST" if body is not None else "GET"))
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                raw = response.read()
+                parsed = json.loads(raw.decode("utf-8")) if raw else {}
+                return parsed, response.headers
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"Gemini API HTTP {e.code}: {detail[:600]}") from e
+
+    def _gemini_upload_file(self, api_key: str, media_path: str) -> dict[str, Any]:
+        mime_type = mimetypes.guess_type(media_path)[0] or "application/octet-stream"
+        file_size = os.path.getsize(media_path)
+        query = urllib.parse.urlencode({"key": api_key})
+        metadata = {"file": {"display_name": os.path.basename(media_path)}}
+        _, headers = self._gemini_request(
+            f"https://generativelanguage.googleapis.com/upload/v1beta/files?{query}",
+            payload=metadata,
+            headers={
+                "X-Goog-Upload-Protocol": "resumable",
+                "X-Goog-Upload-Command": "start",
+                "X-Goog-Upload-Header-Content-Length": str(file_size),
+                "X-Goog-Upload-Header-Content-Type": mime_type,
+            },
+            timeout=60,
+        )
+        upload_url = headers.get("X-Goog-Upload-URL")
+        if not upload_url:
+            raise RuntimeError("Gemini API did not return an upload URL.")
+        with open(media_path, "rb") as media_file:
+            uploaded, _ = self._gemini_request(
+                upload_url,
+                headers={
+                    "Content-Length": str(file_size),
+                    "X-Goog-Upload-Offset": "0",
+                    "X-Goog-Upload-Command": "upload, finalize",
+                },
+                data=media_file.read(),
+                timeout=600,
+            )
+        return uploaded.get("file", uploaded)
+
+    def _gemini_wait_for_file(self, api_key: str, uploaded_file: dict[str, Any]) -> dict[str, Any]:
+        name = uploaded_file.get("name")
+        if not name:
+            raise RuntimeError(f"Gemini API returned an invalid uploaded file: {uploaded_file!r}")
+        query = urllib.parse.urlencode({"key": api_key})
+        for attempt in range(60):
+            current, _ = self._gemini_request(f"https://generativelanguage.googleapis.com/v1beta/{name}?{query}", timeout=30)
+            state = current.get("state", "ACTIVE")
+            if isinstance(state, dict):
+                state = state.get("name", "")
+            if state == "ACTIVE":
+                return current
+            if state == "FAILED":
+                raise RuntimeError(f"Gemini media processing failed: {current!r}")
+            if attempt == 0 or (attempt + 1) % 5 == 0:
+                self.gemini_progress_stage_signal.emit(f"Gemini SRT: processing uploaded media... {(attempt + 1) * 2}s")
+            time.sleep(2)
+        raise RuntimeError("Gemini media processing timed out.")
+
+    def _gemini_generate_transcript(self, api_key: str, model: str, prompt: str, uploaded_file: dict[str, Any]) -> str:
+        query = urllib.parse.urlencode({"key": api_key})
+        payload = {
+            "contents": [{
+                "role": "user",
+                "parts": [
+                    {"file_data": {
+                        "mime_type": uploaded_file.get("mimeType") or uploaded_file.get("mime_type") or "application/octet-stream",
+                        "file_uri": uploaded_file.get("uri"),
+                    }},
+                    {"text": prompt},
+                ],
+            }],
+            "generationConfig": {"temperature": 0.1},
+        }
+        result, _ = self._gemini_request(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{urllib.parse.quote(model)}:generateContent?{query}",
+            payload=payload,
+            timeout=600,
+        )
+        try:
+            parts = result["candidates"][0]["content"]["parts"]
+            transcript = "\n".join(str(part.get("text", "")) for part in parts if part.get("text")).strip()
+        except Exception as e:
+            raise RuntimeError(f"Gemini API returned no transcript: {result!r}") from e
+        if not transcript:
+            raise RuntimeError(f"Gemini API returned an empty transcript: {result!r}")
+        return transcript
+
+    def _gemini_generate_text(self, api_key: str, model: str, prompt: str) -> str:
+        """Generate text through Gemini without re-uploading the media file."""
+        query = urllib.parse.urlencode({"key": api_key})
+        payload = {
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": 0.15},
+        }
+        result, _ = self._gemini_request(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{urllib.parse.quote(model)}:generateContent?{query}",
+            payload=payload,
+            timeout=600,
+        )
+        try:
+            parts = result["candidates"][0]["content"]["parts"]
+            generated = "\n".join(str(part.get("text", "")) for part in parts if part.get("text")).strip()
+        except Exception as e:
+            raise RuntimeError(f"Gemini API returned no translated transcript: {result!r}") from e
+        if not generated:
+            raise RuntimeError(f"Gemini API returned an empty translated transcript: {result!r}")
+        return generated
+
+    def _table_to_labeled_srt(self) -> str:
+        blocks = []
+        for row in range(self.segment_table.rowCount()):
+            start_item = self.segment_table.item(row, 0)
+            end_item = self.segment_table.item(row, 1)
+            text_item = self.segment_table.item(row, 4)
+            if not start_item or not end_item or not text_item:
+                continue
+            start_ms = start_item.data(QT_USER_ROLE)
+            end_ms = end_item.data(QT_USER_ROLE)
+            if start_ms is None or end_ms is None:
+                continue
+            combo = self.segment_table.cellWidget(row, 3)
+            role = combo.currentText().strip() if isinstance(combo, QComboBox) else ""
+            text = text_item.text().strip()
+            if role and not text.startswith("["):
+                text = f"[{role}] {text}"
+            blocks.append(f"{len(blocks) + 1}\n{self.ms_to_time(int(start_ms))} --> {self.ms_to_time(int(end_ms))}\n{text}")
+        return "\n\n".join(blocks).strip() + ("\n" if blocks else "")
+
+    def _table_to_plain_srt(self) -> str:
+        blocks = []
+        for row in range(self.segment_table.rowCount()):
+            start_item = self.segment_table.item(row, 0)
+            end_item = self.segment_table.item(row, 1)
+            text_item = self.segment_table.item(row, 4)
+            if not start_item or not end_item or not text_item:
+                continue
+            start_ms = start_item.data(QT_USER_ROLE)
+            end_ms = end_item.data(QT_USER_ROLE)
+            text = text_item.text().strip()
+            if start_ms is None or end_ms is None or not text:
+                continue
+            blocks.append(f"{len(blocks) + 1}\n{self.ms_to_time(int(start_ms))} --> {self.ms_to_time(int(end_ms))}\n{text}")
+        return "\n\n".join(blocks).strip() + ("\n" if blocks else "")
+
+    def _build_gemini_contextual_translation_prompt(self, original_srt: str, guidance: str, profiles_context: str = "") -> str:
+        return (
+            "You are translating a complete drama subtitle file into natural Khmer.\n"
+            "First read the ENTIRE original-language SRT before translating any line. Infer the story context, "
+            "character identities, relationships, hierarchy, honorifics, emotional tone, and who is speaking to whom. "
+            "Use those relationships consistently throughout the Khmer translation.\n"
+            "Use the confirmed Character Profiles as hard rules when they are provided. For example, do not use "
+            "lover-style បង-អូន for a mother-child relationship; use the address rule supplied by the user.\n"
+            "Preserve every subtitle number and timestamp exactly. Translate every [Speaker] label into Khmer too, "
+            "including character names and traits, while keeping one stable Khmer label for the same character. "
+            "Use Khmer transliteration for foreign names, for example [ស៊ី ស្យាវរ៉ាន (ស្រី, ពេញវ័យ)], and use generic "
+            "Khmer labels like [ប្រុស, ចាស់], [ប្រុស, ពេញវ័យ], or [ស្រី, ពេញវ័យ] when the name is unknown. "
+            "Translate spoken dialogue into Khmer. Return ONLY valid "
+            "SRT with no Markdown fences, notes, explanations, summaries, or relationship analysis.\n\n"
+            f"Confirmed Character Profiles:\n{profiles_context.strip() or 'No confirmed profiles.'}\n\n"
+            f"Additional translation guidance:\n{guidance.strip()}\n\n"
+            f"Complete original-language SRT:\n{original_srt.strip()}\n"
+        )
+
+    def _build_gemini_capcut_video_prompt(self, capcut_srt: str, guidance: str, profiles_context: str = "") -> str:
+        return (
+            "You are given a video/audio file and a CapCut-generated original-language SRT. "
+            "Do NOT create new timestamps. Use the CapCut SRT as the timing authority.\n"
+            "Watch the video and listen to the audio to understand who is speaking in each provided time range. "
+            "Use visible mouth movement, voice tone, off-screen dialogue, scene context, and continuity across the whole clip "
+            "to assign stable speaker tags. Then translate each subtitle text into natural Khmer.\n\n"
+            "Hard requirements:\n"
+            "1. Return ONLY valid SRT. No Markdown, no notes, no explanation.\n"
+            "2. Keep every subtitle number exactly as provided.\n"
+            "3. Keep every timestamp exactly as provided, character-for-character.\n"
+            "4. Keep the same number of subtitle blocks. Do not merge, split, delete, or reorder blocks.\n"
+            "5. Prefix the translated dialogue with exactly ONE Khmer speaker tag, for example [ស៊ី ស្យាវរ៉ាន (ស្រី, ពេញវ័យ)] or [ស្រី, ពេញវ័យ]. "
+            "The tag must be on the same text line as the translated dialogue, not on a separate line.\n"
+            "6. Translate spoken dialogue to Khmer using the story context and relationship rules. Translate or transliterate "
+            "all speaker names and tag traits into Khmer; do not output English tags like [Male, Adult] or [Female, Elder]. "
+            "Avoid mixing lover terms like បង-អូន into mother-child or authority relationships.\n"
+            "7. If the CapCut text has recognition mistakes, use the video/audio/context to infer the intended meaning, "
+            "but still preserve the CapCut timing.\n\n"
+            "Forbidden output inside subtitle text: speaker analysis, character lists, relationship notes, labels like "
+            "'Speaker:', 'Character:', 'Voice:', 'Scene:', or standalone lines containing only a name/tag. "
+            "Only the Khmer dialogue should remain after the one leading Khmer speaker tag.\n\n"
+            f"Confirmed Character Profiles:\n{profiles_context.strip() or 'No confirmed profiles.'}\n\n"
+            f"Additional user guidance:\n{guidance.strip() or 'None'}\n\n"
+            f"CapCut original SRT to translate and tag while preserving timings:\n{capcut_srt.strip()}\n"
+        )
+
+    def _build_gemini_transcription_prompt(self) -> str:
+        return (
+            "Transcribe the complete media accurately in its ORIGINAL spoken language.\n"
+            "Return ONLY valid SRT subtitles, formatted exactly like CapCut output.\n\n"
+            "Required SRT format for every block:\n"
+            "1\n"
+            "00:00:00,100 --> 00:00:01,333\n"
+            "[ស្រី, ពេញវ័យ] 好好衬托你姐姐\n\n"
+            "2\n"
+            "00:00:01,333 --> 00:00:03,400\n"
+            "[ប្រុស, ពេញវ័យ] 别惹事知道吗\n\n"
+            "Timestamp rules:\n"
+            "1. Use exact SRT timestamps as HH:MM:SS,mmm --> HH:MM:SS,mmm.\n"
+            "2. Start each cue exactly when the speaker's mouth/voice begins and end when that mouth movement/voice ends.\n"
+            "3. Preserve real silent gaps like CapCut. If there is no speech, leave a gap between blocks; do not stretch the previous cue through silence.\n"
+            "4. Split at natural pauses, speaker changes, reactions, breath gaps, and visible mouth closures. Prefer short mouth-synced cues, usually 0.7 to 2.8 seconds.\n"
+            "5. Do not merge multiple spoken lines into one long subtitle. Avoid cues longer than 4 seconds unless the same speaker truly speaks continuously without a mouth/voice pause.\n"
+            "6. Consecutive cues may touch when speech is continuous, for example 00:00:01,333 --> 00:00:03,400 then 00:00:03,400 --> 00:00:05,200.\n"
+            "7. Cues must never overlap and must stay in chronological order.\n\n"
+            "Speaker rules:\n"
+            "1. Carefully identify speakers using visible mouth movement, voice tone, off-screen dialogue, scene context, and continuity.\n"
+            "2. Prefix every subtitle text with exactly one Khmer [Speaker] label.\n"
+            "3. Use Khmer-transliterated character names when known, with traits in Khmer, for example [ស៊ី ស្យាវរ៉ាន (ស្រី, ពេញវ័យ)].\n"
+            "4. If the name is unknown, do not use numbered labels like [អ្នកនិយាយ_1]. Use Khmer trait labels such as [ស្រី, ពេញវ័យ], [ប្រុស, ចាស់], or [ប្រុស, ពេញវ័យ].\n"
+            "5. Keep the same speaker label for the same person throughout the full media.\n\n"
+            "Output rules:\n"
+            "1. Return only SRT. No Markdown fences, notes, explanation, summaries, JSON, tables, or bullet points.\n"
+            "2. Subtitle numbers must be sequential starting at 1.\n"
+            "3. Keep the spoken text in the original language for this transcription step.\n"
+        )
+
+    def _run_gemini_transcribe_thread(self, keys: list[str], media_path: str, model: str, prompt: str, translate_after: bool = False) -> None:
+        errors = []
+        def cancelled() -> bool:
+            if self.stop_event.is_set():
+                if translate_after:
+                    self.gemini_transcribe_finished_signal.emit(False, "Gemini job stopped by user.")
+                else:
+                    self.gemini_stage1_finished_signal.emit(False, "Gemini job stopped by user.")
+                return True
+            return False
+
+        for index, api_key in enumerate(keys, start=1):
+            try:
+                if cancelled():
+                    return
+                self.safe_log(f"🔑 Gemini Transcribe: trying API key {index}/{len(keys)} with {model}...")
+                self.gemini_progress_stage_signal.emit(f"Gemini SRT: uploading media with API key {index}/{len(keys)}...")
+                uploaded = self._gemini_upload_file(api_key, media_path)
+                if cancelled():
+                    return
+                self.gemini_progress_stage_signal.emit("Gemini SRT: waiting for media processing...")
+                uploaded = self._gemini_wait_for_file(api_key, uploaded)
+                if cancelled():
+                    return
+                original_prompt = self._build_gemini_transcription_prompt()
+                self.gemini_progress_stage_signal.emit("Gemini SRT: transcribing original dialogue and speakers...")
+                original_transcript = self._clean_gemini_srt_text(
+                    self._gemini_generate_transcript(api_key, model, original_prompt, uploaded)
+                )
+                original_transcript = self._normalize_gemini_transcription_timing(original_transcript)
+                if cancelled():
+                    return
+                self.gemini_original_transcript_signal.emit(original_transcript)
+                if not translate_after:
+                    self.safe_log(f"✅ Gemini Step 1 transcription succeeded with API key {index}.")
+                    self.gemini_stage1_finished_signal.emit(True, original_transcript)
+                    return
+                self.safe_log("🧠 Gemini Transcribe: analyzing the full story and translating contextually into Khmer...")
+                self.gemini_progress_stage_signal.emit("Gemini SRT: analyzing story context and translating to Khmer...")
+                translated_srt = self._gemini_generate_text(
+                    api_key,
+                    model,
+                    self._build_gemini_contextual_translation_prompt(original_transcript, prompt, self._character_profiles_context()),
+                )
+                translated_srt = self._clean_gemini_srt_text(translated_srt)
+                translated_srt = self._align_translated_srt_to_source_timing(translated_srt, original_transcript)
+                if cancelled():
+                    return
+                self.safe_log(f"✅ Gemini contextual Khmer translation succeeded with API key {index}.")
+                self.gemini_transcribe_finished_signal.emit(True, translated_srt)
+                return
+            except Exception as e:
+                errors.append(f"Key {index}: {e}")
+                self.safe_log(f"⚠️ Gemini API key {index} failed. Trying the next key...")
+                self.gemini_progress_stage_signal.emit(f"Gemini SRT: API key {index} failed, trying failover...")
+        if translate_after:
+            self.gemini_transcribe_finished_signal.emit(False, "\n\n".join(errors))
+        else:
+            self.gemini_stage1_finished_signal.emit(False, "\n\n".join(errors))
+
+    def _set_gemini_buttons_enabled(self, enabled: bool) -> None:
+        if hasattr(self, "btn_gemini_transcribe"):
+            self.btn_gemini_transcribe.setEnabled(enabled)
+        if hasattr(self, "btn_gemini_translate_profiles"):
+            self.btn_gemini_translate_profiles.setEnabled(enabled)
+        if hasattr(self, "btn_timeline_transcribe"):
+            self.btn_timeline_transcribe.setEnabled(enabled)
+        if hasattr(self, "btn_timeline_translate"):
+            self.btn_timeline_translate.setEnabled(enabled)
+        if hasattr(self, "btn_timeline_capcut_video_translate"):
+            self.btn_timeline_capcut_video_translate.setEnabled(enabled)
+        if hasattr(self, "btn_home_gemini_transcribe"):
+            self.btn_home_gemini_transcribe.setEnabled(enabled)
+
+    def _on_gemini_stage1_finished(self, success: bool, text: str) -> None:
+        self._set_gemini_buttons_enabled(True)
+        self._set_gemini_progress_stage("")
+        if not success and "stopped by user" in str(text).lower():
+            self.gemini_transcribe_status.setText("Step 1 stopped")
+            self.gemini_transcribe_status.setStyleSheet("color: #dc3545; font-weight: bold;")
+            self.progress.setValue(0)
+            self.gemini_home_status.setText("Gemini SRT stopped.")
+            self.gemini_home_status.setStyleSheet("color: #dc3545; font-weight: bold;")
+            self.log("🛑 Gemini Transcribe stopped by user.")
+            QTimer.singleShot(4000, self._hide_gemini_home_status)
+            self._gemini_import_to_table = False
+            self._gemini_one_click_khmer = False
+            return
+        if success:
+            text = self._clean_gemini_srt_text(text)
+            self.gemini_original_srt = text
+            self.gemini_transcribe_status.setText("Step 1 completed: original SRT ready")
+            self.gemini_transcribe_status.setStyleSheet("color: #28a745; font-weight: bold;")
+            self.progress.setValue(100)
+            self.gemini_home_status.setText("Step 1 complete. Review timing, then scan speakers.")
+            self.gemini_home_status.setStyleSheet("color: #28a745; font-weight: bold;")
+            original_path = self.get_config_path("gemini_original_transcript_latest.srt")
+            with open(original_path, "w", encoding="utf-8") as transcript_file:
+                transcript_file.write(text)
+            if getattr(self, "_gemini_import_to_table", False):
+                if self.parse_srt(original_path):
+                    self.load_srt(original_path)
+                    self.tabs.setCurrentIndex(0)
+                    self.log("✅ Step 1 original SRT loaded. Check mouth timing before Step 2/3.")
+                    self._scan_character_profiles_from_table()
+                else:
+                    QMessageBox.warning(self, "Gemini Transcribe", "Gemini returned text that is not valid SRT.")
+        else:
+            self.gemini_transcribe_status.setText("Step 1 failed")
+            self.gemini_transcribe_status.setStyleSheet("color: #dc3545; font-weight: bold;")
+            self.progress.setValue(0)
+            self.gemini_home_status.setText("Step 1 failed. Check Settings and Logs.")
+            self.gemini_home_status.setStyleSheet("color: #dc3545; font-weight: bold;")
+            QMessageBox.warning(self, "Gemini Transcribe", f"Transcription failed:\n{text[:1200]}")
+        QTimer.singleShot(6000, self._hide_gemini_home_status)
+        self._gemini_import_to_table = False
+        self._gemini_one_click_khmer = False
+
+    def _apply_translated_subs_to_current_table(self, translated_subs: list[dict[str, Any]]) -> int:
+        """Apply translated SRT text to the existing rows without changing timing or checkbox state."""
+        if not translated_subs or not hasattr(self, "segment_table"):
+            return 0
+
+        text_by_number: dict[int, str] = {}
+        for sub in translated_subs:
+            number = sub.get("number")
+            text = str(sub.get("text", "") or "").strip()
+            if isinstance(number, int) and text:
+                text_by_number[number] = text
+
+        changed = 0
+        self.segment_table.blockSignals(True)
+        try:
+            for row in range(self.segment_table.rowCount()):
+                translated_text = text_by_number.get(row + 1)
+                if translated_text is None and row < len(translated_subs):
+                    translated_text = str(translated_subs[row].get("text", "") or "").strip()
+                if not translated_text:
+                    continue
+
+                role, clean_text = self._extract_role_and_dialogue_for_tts(translated_text)
+
+                text_item = self.segment_table.item(row, 4)
+                if text_item is None:
+                    text_item = QTableWidgetItem()
+                    self.segment_table.setItem(row, 4, text_item)
+                text_item.setText(clean_text)
+
+                if role:
+                    if role not in self.roles:
+                        self.roles.append(role)
+                        self._initialize_new_role_config(role)
+                    combo = self.segment_table.cellWidget(row, 3)
+                    if isinstance(combo, QComboBox):
+                        if combo.findText(role) < 0:
+                            combo.addItem(role)
+                        combo.setCurrentText(role)
+                        self.apply_role_combo_highlight(combo, role)
+                changed += 1
+        finally:
+            self.segment_table.blockSignals(False)
+
+        if changed:
+            current_voice = self.voice_combo.currentText()
+            self.voice_combo.blockSignals(True)
+            self._refresh_voice_combo(current_voice)
+            self.voice_combo.blockSignals(False)
+            self._refresh_tts_scope_roles()
+            self._clear_generated_audio_state()
+            self._refresh_timeline()
+        return changed
+
+    def _extract_role_and_dialogue_for_tts(self, translated_text: str) -> tuple[str, str]:
+        """Extract one speaker tag and remove metadata so TTS reads dialogue only."""
+        raw_text = str(translated_text or "").replace("\r", "\n").strip()
+        if not raw_text:
+            return "", ""
+
+        role = ""
+        dialogue_lines = []
+        metadata_prefix = r"(?:Speaker|Character|Role|Voice|Scene|Tag|Name|តួអង្គ|អ្នកនិយាយ|សម្លេង|ឈ្មោះ)"
+        metadata_starts = (
+            "speaker:", "speaker：", "character:", "character：", "role:", "role：",
+            "voice:", "voice：", "scene:", "scene：", "tag:", "tag：", "name:", "name：",
+            "តួអង្គ:", "តួអង្គ：", "អ្នកនិយាយ:", "អ្នកនិយាយ：", "សម្លេង:", "សម្លេង：",
+            "ឈ្មោះ:", "ឈ្មោះ：",
+        )
+        for raw_line in raw_text.split("\n"):
+            line = raw_line.strip()
+            if not line:
+                continue
+            while True:
+                match = re.match(r"^\[([^\]]{1,120})\]\s*", line)
+                if not match:
+                    break
+                if not role:
+                    role = normalize_role_name(match.group(1).strip())
+                line = line[match.end():].strip()
+            if not line:
+                continue
+            if line.lower().startswith(metadata_starts):
+                rest = re.split(r"[:：]", line, maxsplit=1)[1].strip() if re.search(r"[:：]", line) else ""
+                tokens = rest.split()
+                if len(tokens) <= 2:
+                    continue
+                line = " ".join(tokens[1:]).strip()
+            if re.match(rf"^{metadata_prefix}\s*[:：-]\s*[^។.!?]*$", line, flags=re.IGNORECASE):
+                continue
+            dialogue_lines.append(line)
+
+        text = " ".join(dialogue_lines).strip()
+        text = re.sub(
+            rf"^{metadata_prefix}\s*[:：-]\s*[^:：-]{{0,80}}\s*[:：-]\s*",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        ).strip()
+        text = re.sub(rf"^{metadata_prefix}\s*[:：-]\s*", "", text, flags=re.IGNORECASE).strip()
+        text = re.sub(r"^[^:：]{1,40}[:：]\s*\S{1,40}\s+", "", text).strip()
+
+        # If Gemini left extra bracket tags in the dialogue, remove them instead of sending them to TTS.
+        text = re.sub(r"\[[^\]]{1,120}\]", "", text).strip()
+        text = re.sub(r"^[.…\s]+", "", text).strip()
+        text = re.sub(r"\s+", " ", text).strip(" -:：")
+        return role, text
+
+    def clean_current_table_tags(self) -> None:
+        """Clean speaker tags/metadata from current table text without changing timings."""
+        if not hasattr(self, "segment_table"):
+            return
+        changed = 0
+        self.segment_table.blockSignals(True)
+        try:
+            for row in range(self.segment_table.rowCount()):
+                item = self.segment_table.item(row, 4)
+                if item is None:
+                    continue
+                role, clean_text = self._extract_role_and_dialogue_for_tts(item.text())
+                if clean_text and clean_text != item.text():
+                    item.setText(clean_text)
+                    changed += 1
+                if role:
+                    if role not in self.roles:
+                        self.roles.append(role)
+                        self._initialize_new_role_config(role)
+                    combo = self.segment_table.cellWidget(row, 3)
+                    if isinstance(combo, QComboBox):
+                        if combo.findText(role) < 0:
+                            combo.addItem(role)
+                        combo.setCurrentText(role)
+                        self.apply_role_combo_highlight(combo, role)
+        finally:
+            self.segment_table.blockSignals(False)
+        if changed:
+            self._clear_generated_audio_state()
+            self.log(f"🧹 Cleaned speaker tags/metadata from {changed} subtitle row(s).")
+        else:
+            self.log("🧹 No extra speaker tags found in subtitle text.")
+
+    def _on_gemini_transcribe_finished(self, success: bool, text: str) -> None:
+        self._set_gemini_buttons_enabled(True)
+        self._set_gemini_progress_stage("")
+        if not success and "stopped by user" in str(text).lower():
+            self.gemini_transcribe_status.setText("Gemini job stopped")
+            self.gemini_transcribe_status.setStyleSheet("color: #dc3545; font-weight: bold;")
+            self.progress.setValue(0)
+            self.gemini_home_status.setText("Gemini job stopped.")
+            self.gemini_home_status.setStyleSheet("color: #dc3545; font-weight: bold;")
+            self.log("🛑 Gemini job stopped by user.")
+            QTimer.singleShot(4000, self._hide_gemini_home_status)
+            self._gemini_import_to_table = False
+            self._gemini_one_click_khmer = False
+            return
+        if success:
+            text = self._clean_gemini_srt_text(text)
+            one_click = getattr(self, "_gemini_one_click_khmer", False)
+            self.gemini_transcribe_status.setText("Khmer subtitles ready" if one_click else "Step 3 completed: Khmer translation ready")
+            self.gemini_transcribe_status.setStyleSheet("color: #28a745; font-weight: bold;")
+            self.progress.setValue(100)
+            self.gemini_home_status.setText("Transcribe complete: Khmer subtitles loaded." if one_click else "Step 3 complete: translated Khmer SRT loaded.")
+            self.gemini_home_status.setStyleSheet("color: #28a745; font-weight: bold;")
+            if getattr(self, "_gemini_import_to_table", False):
+                transcript_path = self.get_config_path("gemini_transcript_latest.srt")
+                with open(transcript_path, "w", encoding="utf-8") as transcript_file:
+                    transcript_file.write(text)
+                translated_subs = self.parse_srt(transcript_path)
+                if translated_subs:
+                    if self.segment_table.rowCount() > 0:
+                        changed = self._apply_translated_subs_to_current_table(translated_subs)
+                        self.tabs.setCurrentIndex(0)
+                        if one_click:
+                            self.log(f"✅ Transcribe workflow complete: loaded {changed} Khmer subtitle row(s) into the segment table.")
+                        else:
+                            self.log(f"✅ Khmer translation applied to {changed} existing subtitle row(s). Generate Audio will use the translated text.")
+                    else:
+                        self.load_srt(transcript_path)
+                        self.tabs.setCurrentIndex(0)
+                        if one_click:
+                            self.log(f"✅ Transcribe workflow complete: loaded {len(translated_subs)} Khmer subtitle row(s) into the segment table.")
+                else:
+                    self.log("⚠️ Gemini returned text that is not valid SRT. The existing Home table was left unchanged.")
+                    QMessageBox.warning(
+                        self,
+                        "Gemini Transcribe",
+                        "Gemini returned text that is not valid SRT. The existing Home table was left unchanged.",
+                    )
+        else:
+            self.gemini_transcribe_status.setText("All Gemini API keys failed")
+            self.gemini_transcribe_status.setStyleSheet("color: #dc3545; font-weight: bold;")
+            self.progress.setValue(0)
+            self.gemini_home_status.setText("Gemini SRT: failed. Check Settings and Logs.")
+            self.gemini_home_status.setStyleSheet("color: #dc3545; font-weight: bold;")
+            QMessageBox.warning(self, "Gemini Transcribe", f"Transcription failed:\n{text[:1200]}")
+        QTimer.singleShot(6000, self._hide_gemini_home_status)
+        self._gemini_import_to_table = False
+        self._gemini_one_click_khmer = False
+
+    def _start_gemini_translate_stage3(self) -> None:
+        self._save_gemini_transcribe_settings()
+        self._save_character_profiles_to_role_configs()
+        keys = self._get_gemini_api_keys()
+        if not keys:
+            QMessageBox.warning(self, "Gemini Translate", "Enter at least one Gemini API key first.")
+            return
+        original_srt = self._table_to_labeled_srt()
+        if not original_srt.strip():
+            original_srt = self.gemini_original_srt.strip()
+        if not original_srt.strip():
+            QMessageBox.warning(self, "Gemini Translate", "Run Step 1 or load an SRT before translating.")
+            return
+        if hasattr(self, "character_profiles_table") and self.character_profiles_table.rowCount() == 0:
+            self._scan_character_profiles_from_table()
+        self._gemini_import_to_table = True
+        self._gemini_one_click_khmer = False
+        self.stop_event.clear()
+        self._set_gemini_buttons_enabled(False)
+        self._set_gemini_progress_stage("Step 3: translating with character profiles...")
+        self.log("🌐 Step 3: translating with confirmed character profiles.")
+        self.start_worker_thread(
+            target=self._run_gemini_translate_thread,
+            args=(
+                keys,
+                str(self.gemini_model_combo.currentData()),
+                self.gemini_prompt_input.toPlainText().strip(),
+                original_srt,
+                self._character_profiles_context(),
+            ),
+        )
+
+    def _start_gemini_capcut_video_translate(self) -> None:
+        """Use current CapCut SRT timing plus the video file to tag speakers and translate."""
+        self._save_gemini_transcribe_settings()
+        self._save_character_profiles_to_role_configs()
+        keys = self._get_gemini_api_keys()
+        if not keys:
+            QMessageBox.warning(self, "CapCut + Video Translate", "Enter at least one Gemini API key first.")
+            return
+
+        media_path = self.current_video_path if self.current_video_path and os.path.exists(self.current_video_path) else ""
+        if not media_path:
+            media_path, _ = QFileDialog.getOpenFileName(
+                self,
+                "Select Video for Gemini Speaker Tagging + Translation",
+                self.app_settings.get("last_video_dir", ""),
+                "Media Files (*.mp4 *.mkv *.mov *.avi *.webm *.mp3 *.wav *.m4a *.aac *.flac);;All Files (*)",
+            )
+        if not media_path or not os.path.exists(media_path):
+            QMessageBox.warning(self, "CapCut + Video Translate", "Open or select the original video/audio file first.")
+            return
+
+        capcut_srt = self._table_to_plain_srt()
+        if not capcut_srt.strip():
+            QMessageBox.warning(self, "CapCut + Video Translate", "Load the CapCut original SRT into the table first.")
+            return
+
+        self._gemini_import_to_table = True
+        self._gemini_one_click_khmer = False
+        self.stop_event.clear()
+        self._set_gemini_buttons_enabled(False)
+        self._set_gemini_progress_stage("CapCut+Video: uploading media to Gemini...")
+        self.log("🎬 CapCut+Video Translate started: Gemini will preserve CapCut timings.")
+        self.start_worker_thread(
+            target=self._run_gemini_capcut_video_translate_thread,
+            args=(
+                keys,
+                media_path,
+                str(self.gemini_model_combo.currentData()),
+                self.gemini_prompt_input.toPlainText().strip(),
+                capcut_srt,
+                self._character_profiles_context(),
+            ),
+        )
+
+    def _run_gemini_capcut_video_translate_thread(self, keys: list[str], media_path: str, model: str, guidance: str, capcut_srt: str, profiles_context: str) -> None:
+        errors = []
+        def cancelled() -> bool:
+            if self.stop_event.is_set():
+                self.gemini_transcribe_finished_signal.emit(False, "Gemini job stopped by user.")
+                return True
+            return False
+
+        for index, api_key in enumerate(keys, start=1):
+            try:
+                if cancelled():
+                    return
+                self.safe_log(f"🔑 CapCut+Video Translate: trying API key {index}/{len(keys)} with {model}...")
+                self.gemini_progress_stage_signal.emit(f"CapCut+Video: uploading media with API key {index}/{len(keys)}...")
+                uploaded = self._gemini_upload_file(api_key, media_path)
+                if cancelled():
+                    return
+                self.gemini_progress_stage_signal.emit("CapCut+Video: waiting for media processing...")
+                uploaded = self._gemini_wait_for_file(api_key, uploaded)
+                if cancelled():
+                    return
+                self.gemini_progress_stage_signal.emit("CapCut+Video: tagging speakers and translating with fixed timings...")
+                translated_srt = self._clean_gemini_srt_text(
+                    self._gemini_generate_transcript(
+                        api_key,
+                        model,
+                        self._build_gemini_capcut_video_prompt(capcut_srt, guidance, profiles_context),
+                        uploaded,
+                    )
+                )
+                translated_srt = self._align_translated_srt_to_source_timing(translated_srt, capcut_srt)
+                if cancelled():
+                    return
+                self.safe_log(f"✅ CapCut+Video translation succeeded with API key {index}.")
+                self.gemini_transcribe_finished_signal.emit(True, translated_srt)
+                return
+            except Exception as e:
+                errors.append(f"Key {index}: {e}")
+                self.safe_log(f"⚠️ CapCut+Video API key {index} failed. Trying the next key...")
+                self.gemini_progress_stage_signal.emit(f"CapCut+Video: API key {index} failed, trying failover...")
+        self.gemini_transcribe_finished_signal.emit(False, "\n\n".join(errors))
+
+    def _run_gemini_translate_thread(self, keys: list[str], model: str, guidance: str, original_srt: str, profiles_context: str) -> None:
+        errors = []
+        def cancelled() -> bool:
+            if self.stop_event.is_set():
+                self.gemini_transcribe_finished_signal.emit(False, "Gemini job stopped by user.")
+                return True
+            return False
+
+        for index, api_key in enumerate(keys, start=1):
+            try:
+                if cancelled():
+                    return
+                self.safe_log(f"🔑 Gemini Translate: trying API key {index}/{len(keys)} with {model}...")
+                translated_srt = self._gemini_generate_text(
+                    api_key,
+                    model,
+                    self._build_gemini_contextual_translation_prompt(original_srt, guidance, profiles_context),
+                )
+                translated_srt = self._clean_gemini_srt_text(translated_srt)
+                translated_srt = self._align_translated_srt_to_source_timing(translated_srt, original_srt)
+                if cancelled():
+                    return
+                self.safe_log(f"✅ Gemini Step 3 translation succeeded with API key {index}.")
+                self.gemini_transcribe_finished_signal.emit(True, translated_srt)
+                return
+            except Exception as e:
+                errors.append(f"Key {index}: {e}")
+                self.safe_log(f"⚠️ Gemini Translate key {index} failed. Trying the next key...")
+                self.gemini_progress_stage_signal.emit(f"Step 3: API key {index} failed, trying failover...")
+        self.gemini_transcribe_finished_signal.emit(False, "\n\n".join(errors))
+
+    def _on_gemini_original_transcript_ready(self, text: str) -> None:
+        """Display and retain the original-language SRT before Khmer translation."""
+        cleaned = self._clean_gemini_srt_text(text)
+        self.gemini_original_srt = cleaned
+        original_path = self.get_config_path("gemini_original_transcript_latest.srt")
+        with open(original_path, "w", encoding="utf-8") as transcript_file:
+            transcript_file.write(cleaned)
+
+    def _clean_gemini_srt_text(self, text: str) -> str:
+        """Remove Markdown wrappers that Gemini may add around SRT output."""
+        cleaned = text.strip()
+        cleaned = re.sub(r"^```(?:srt|text)?\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+        cleaned = cleaned.replace("\ufeff", "").replace("\u200b", "")
+        cleaned = re.sub(r"\s*(?:--&gt;|→|–>|—>|->)\s*", " --> ", cleaned)
+        cleaned = re.sub(
+            r"(?m)^\s*(\d{1,2}:\d{2}:\d{2})[.](\d{1,3})\s*-->\s*(\d{1,2}:\d{2}:\d{2})[.](\d{1,3})\s*$",
+            lambda m: f"{m.group(1)},{m.group(2).ljust(3, '0')[:3]} --> {m.group(3)},{m.group(4).ljust(3, '0')[:3]}",
+            cleaned,
+        )
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        return cleaned.strip() + "\n"
+
+    def _parse_srt_text_blocks(self, text: str) -> list[dict[str, Any]]:
+        """Parse Gemini SRT text without needing a temporary file."""
+        cues: list[dict[str, Any]] = []
+        lines = [line.rstrip("\r") for line in text.replace("\r\n", "\n").split("\n")]
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            if not line:
+                i += 1
+                continue
+
+            number = len(cues) + 1
+            if line.isdigit() and i + 1 < len(lines):
+                number = int(line)
+                i += 1
+                line = lines[i].strip()
+
+            if "-->" not in line:
+                i += 1
+                continue
+
+            try:
+                start_token, end_token = line.split("-->", 1)
+                start_ms = self.time_to_ms(start_token.strip().split()[0])
+                end_ms = self.time_to_ms(end_token.strip().split()[0])
+            except Exception:
+                i += 1
+                continue
+
+            i += 1
+            text_lines = []
+            while i < len(lines) and lines[i].strip():
+                text_lines.append(lines[i].strip())
+                i += 1
+
+            if end_ms > start_ms and text_lines:
+                cues.append({
+                    "number": number,
+                    "start": start_ms,
+                    "end": end_ms,
+                    "text": " ".join(text_lines).strip(),
+                })
+            i += 1
+        return cues
+
+    def _srt_blocks_to_text(self, cues: list[dict[str, Any]]) -> str:
+        blocks = []
+        for index, cue in enumerate(cues, start=1):
+            text = str(cue.get("text", "") or "").strip()
+            if not text:
+                continue
+            blocks.append(
+                f"{index}\n"
+                f"{self.ms_to_time(int(cue.get('start', 0)))} --> {self.ms_to_time(int(cue.get('end', 0)))}\n"
+                f"{text}"
+            )
+        return "\n\n".join(blocks).strip() + ("\n" if blocks else "")
+
+    def _normalize_gemini_transcription_timing(self, srt_text: str) -> str:
+        """Tighten Gemini-created timestamps so generated cues stay closer to speech."""
+        cues = self._parse_srt_text_blocks(srt_text)
+        if not cues:
+            return srt_text
+
+        lead_ms = 180
+        cues.sort(key=lambda cue: (int(cue["start"]), int(cue["end"])))
+        normalized: list[dict[str, Any]] = []
+        previous_end = 0
+
+        for index, cue in enumerate(cues):
+            start = max(0, int(cue["start"]) - lead_ms)
+            end = max(start + 250, int(cue["end"]) - lead_ms)
+            text = str(cue.get("text", "") or "").strip()
+
+            if start < previous_end:
+                start = previous_end
+                end = max(end, start + 250)
+
+            next_start = None
+            for following in cues[index + 1:]:
+                candidate = max(0, int(following["start"]) - lead_ms)
+                if candidate > start:
+                    next_start = candidate
+                    break
+
+            spoken_chars = len(re.sub(r"\[[^\]]+\]|\s+", "", text))
+            max_duration = max(1400, min(6500, spoken_chars * 230 if spoken_chars else 2800))
+            min_duration = 350
+
+            if end - start > max_duration:
+                end = start + max_duration
+
+            if next_start is not None and end > next_start:
+                end = max(start + min_duration, next_start)
+
+            if end <= start:
+                end = start + min_duration
+
+            normalized.append({
+                "number": len(normalized) + 1,
+                "start": start,
+                "end": end,
+                "text": text,
+            })
+            previous_end = end
+
+        return self._srt_blocks_to_text(normalized)
+
+    def _align_translated_srt_to_source_timing(self, translated_srt: str, source_srt: str) -> str:
+        """Keep translated dialogue but restore the trusted source SRT timings."""
+        translated_cues = self._parse_srt_text_blocks(translated_srt)
+        source_cues = self._parse_srt_text_blocks(source_srt)
+        if not translated_cues or not source_cues:
+            return translated_srt
+
+        aligned = []
+        count = min(len(translated_cues), len(source_cues))
+        for index in range(count):
+            translated = translated_cues[index]
+            source = source_cues[index]
+            aligned.append({
+                "number": index + 1,
+                "start": int(source["start"]),
+                "end": int(source["end"]),
+                "text": str(translated.get("text", "") or "").strip(),
+            })
+
+        if len(translated_cues) != len(source_cues):
+            self.safe_log(
+                f"⚠️ Gemini translated {len(translated_cues)} subtitle rows, source timing has {len(source_cues)} rows. "
+                f"Aligned the first {count} rows to prevent bad durations."
+            )
+
+        return self._srt_blocks_to_text(aligned)
+
+    def _save_gemini_transcript(self) -> None:
+        latest_path = self.get_config_path("gemini_transcript_latest.srt")
+        transcript = ""
+        if os.path.exists(latest_path):
+            with open(latest_path, "r", encoding="utf-8") as transcript_file:
+                transcript = transcript_file.read().strip()
+        if not transcript:
+            QMessageBox.warning(self, "Gemini Transcribe", "There is no transcript to save.")
+            return
+        media_path = str(self.app_settings.get("gemini_transcribe_media_path", ""))
+        default_path = os.path.splitext(media_path)[0] + "_transcript.srt"
+        path, _ = QFileDialog.getSaveFileName(self, "Save Gemini Transcript", default_path, "Subtitle Files (*.srt);;Text Files (*.txt)")
+        if path:
+            with open(path, "w", encoding="utf-8") as transcript_file:
+                transcript_file.write(transcript)
+            self.log(f"✅ Gemini transcript saved: {path}")
+
     def _get_gpu_status(self) -> dict[str, str]:
         """Get GPU status for display"""
         if detect_gpu is not None:
@@ -4959,7 +8178,7 @@ class MainWindow(QMainWindow):
                     }
             except Exception:
                 pass
-        
+
         try:
             output = subprocess.check_output(
                 ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
@@ -4999,7 +8218,7 @@ class MainWindow(QMainWindow):
             return bool(output)
         except Exception:
             return False
-    
+
     def _auto_detect_gpu_vs_cpu(self):
         """Auto-detect the best compute mode and update the GPU setting."""
         available = self._is_nvidia_gpu_available()
@@ -5008,7 +8227,7 @@ class MainWindow(QMainWindow):
         # type: ignore
         if available:
             self.safe_log("✅ Auto Detect: NVIDIA GPU found, using GPU encoding.")
-            QMessageBox.information(self, "Auto Detect GPU", 
+            QMessageBox.information(self, "Auto Detect GPU",
                 "✅ GPU Detection Successful\n\n"
                 "NVIDIA GPU found. Video will be encoded using GPU (H.264 NVENC).\n"
                 "This will be faster than CPU encoding.", QMessageBox.Ok)
@@ -5039,11 +8258,8 @@ class MainWindow(QMainWindow):
 
     def _get_ffmpeg_status(self) -> dict[str, str]:
         """Get FFmpeg status for display"""
-        ffmpeg_path = self.app_settings.get("ffmpeg_path", "")
-
-        ffmpeg_cmd = None
-        if ffmpeg_path:
-            ffmpeg_cmd = ffmpeg_path if os.path.exists(ffmpeg_path) else shutil.which(ffmpeg_path)
+        ffmpeg_path = self.get_ffmpeg()
+        ffmpeg_cmd = ffmpeg_path if os.path.exists(ffmpeg_path) else shutil.which(ffmpeg_path)
 
         if ffmpeg_cmd:
             try:
@@ -5062,19 +8278,6 @@ class MainWindow(QMainWindow):
                 return { # type: ignore
                     "text": "⚠ Found (Error)",
                     "color": "#ffc107"
-                }
-
-        # Try to find ffmpeg
-        search_paths = [
-            os.path.join(".", "ffmpeg_bin", "ffmpeg.exe"),
-            os.path.join(".", "ffmpeg.exe"),
-        ]
-
-        for path in search_paths:
-            if os.path.exists(path):
-                return {
-                    "text": "✓ Found (Auto)",
-                    "color": "#28a745"
                 }
 
         return {
@@ -5353,6 +8556,12 @@ except Exception:
                 "ffmpeg_path": "",
                 "update_url": DEFAULT_UPDATE_URL,
                 "khmer_font": DEFAULT_KHMER_FONT,
+                "voxcpm2_enabled": False,
+                "voxcpm2_autostart": False,
+                "voxcpm2_stop_on_close": True,
+                "voxcpm2_voice_mode": "all",
+                "tts_character_scope": "all_tags",
+                "voxcpm2_url": DEFAULT_VOXCPM2_URL,
             }
             self.save_app_settings()
             self.chk_autosave.setChecked(False)
@@ -5444,7 +8653,7 @@ except Exception:
                     QMessageBox.warning(self, "Python Required", message)
                     return
 
-                subprocess.Popen([*python_cmd, script_path]) # type: ignore
+                subprocess.Popen([*python_cmd, script_path], env=self._external_process_env()) # type: ignore
                 self.log(success_message)
             else:
                 self.log(missing_message)
@@ -5455,6 +8664,28 @@ except Exception:
 
     def _subprocess_creation_flags(self) -> int:
         return subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+
+    def _external_process_env(self) -> dict[str, str]:
+        """Return an environment safe for standalone apps launched by this UI."""
+        return external_process_env()
+
+    def open_external_url(self, url: str) -> bool:
+        """Open a web URL without leaking this app's Qt plugin configuration."""
+        try:
+            if sys.platform == "win32":
+                subprocess.Popen(
+                    ["cmd.exe", "/d", "/c", "start", "", url],
+                    env=self._external_process_env(),
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", url], env=self._external_process_env())
+            else:
+                subprocess.Popen(["xdg-open", url], env=self._external_process_env())
+            return True
+        except Exception as e:
+            self.safe_log(f"⚠️ Failed to open URL {url}: {e}")
+            return False
 
     def _configure_audio_converter(self, ffmpeg_bin: str) -> None:
         if ffmpeg_bin and os.path.exists(ffmpeg_bin):
@@ -5494,7 +8725,19 @@ except Exception:
             if os.path.exists(candidate):
                 return candidate
 
-        # 4. បើរកមិនឃើញទាំងអស់ ប្រើពាក្យបញ្ជា System
+        # 4. PyInstaller includes imageio-ffmpeg under _internal. Use that
+        # bundled executable on fresh installs before falling back to PATH.
+        executable_dir = os.path.dirname(os.path.abspath(sys.executable))
+        bundled_patterns = (
+            os.path.join(executable_dir, "_internal", "imageio_ffmpeg", "binaries", "ffmpeg*.exe"),
+            os.path.join(app_dir, "imageio_ffmpeg", "binaries", "ffmpeg*.exe"),
+        )
+        for pattern in bundled_patterns:
+            matches = sorted(glob.glob(pattern))
+            if matches:
+                return matches[0]
+
+        # 5. បើរកមិនឃើញទាំងអស់ ប្រើពាក្យបញ្ជា System
         return "ffmpeg"
     
     def get_ffprobe(self): # type: ignore
@@ -5709,6 +8952,9 @@ except Exception:
     def set_table_row(self, row, start_ms, end_ms, role, text):
         # Helper to set table items (កាត់បន្ថយកូដស្ទួន)
         item_start = QTableWidgetItem(self.ms_to_time(start_ms)); item_start.setData(QT_USER_ROLE, start_ms)
+        item_start.setFlags(item_start.flags() | Qt.ItemIsUserCheckable)
+        item_start.setCheckState(Qt.Unchecked)
+        item_start.setToolTip("Tick this row to generate audio only for selected subtitle rows.")
         self.segment_table.setItem(row, 0, item_start)
         item_end = QTableWidgetItem(self.ms_to_time(end_ms)); item_end.setData(QT_USER_ROLE, end_ms)
         self.segment_table.setItem(row, 1, item_end)
@@ -5743,6 +8989,8 @@ except Exception:
         self.apply_role_combo_highlight(combo, role)
         self.segment_table.setItem(row, 4, QTableWidgetItem(text))
         self.segment_table.setCellWidget(row, 5, self.create_action_widget()) # type: ignore
+        self.set_row_audio_status(row, "Ready", "ready")
+        self._sync_check_all_segments_button()
 
     def on_duration_changed(self, value):
         sb = self.sender()
@@ -5762,31 +9010,101 @@ except Exception:
         item_start = self.segment_table.item(row, 0)
         if item_start:
             start_ms = item_start.data(QT_USER_ROLE)
-            new_end_ms = start_ms + int(round(value * 1000))
-            
-            item_end = self.segment_table.item(row, 1)
-            if item_end:
-                item_end.setText(self.ms_to_time(new_end_ms))
-                item_end.setData(QT_USER_ROLE, new_end_ms)
-            
-            # Check Overlap
-            next_row = row + 1
-            if next_row < self.segment_table.rowCount():
-                item_next = self.segment_table.item(next_row, 0)
-                if item_next:
-                    next_start = item_next.data(QT_USER_ROLE)
-                    if new_end_ms > next_start:
-                        # Overlap -> Red
-                        sb.setStyleSheet("background-color: #feb2b2; font-weight: bold; color: #c53030;")
-                        sb.setToolTip(f"⚠️ Overlap! Next starts at {self.ms_to_time(next_start)}")
-                    elif value > 10.0:
-                        # Long Duration -> Yellow
-                        sb.setStyleSheet("background-color: #fefcbf; font-weight: bold; color: #b7791f;") # type: ignore
-                        sb.setToolTip("⚠️ Warning: Duration > 10s! (វែងខុសប្រក្រតី)")
-                    else:
-                        # Normal -> Blue
-                        sb.setStyleSheet("background-color: #ebf8ff;")
-                        sb.setToolTip("Adjust duration with millisecond precision (កំណត់រយៈពេលត្រឹម 0.001s)")
+            self.update_segment_end_time(row, int(start_ms) + int(round(value * 1000)))
+
+    def update_segment_end_time(self, row: int, requested_end_ms: int) -> int:
+        """Update a row end time and clamp it so adjacent subtitles never overlap."""
+        item_start = self.segment_table.item(row, 0)
+        item_end = self.segment_table.item(row, 1)
+        if not item_start or not item_end:
+            return requested_end_ms
+        start_ms = int(item_start.data(QT_USER_ROLE) or 0)
+        min_end_ms = start_ms + 100
+        max_end_ms = requested_end_ms
+        next_row = row + 1
+        if next_row < self.segment_table.rowCount():
+            item_next = self.segment_table.item(next_row, 0)
+            if item_next:
+                next_start = int(item_next.data(QT_USER_ROLE) or 0)
+                max_end_ms = min(max_end_ms, max(min_end_ms, next_start))
+        new_end_ms = max(min_end_ms, max_end_ms)
+
+        item_end.setText(self.ms_to_time(new_end_ms))
+        item_end.setData(QT_USER_ROLE, new_end_ms)
+
+        sb = self.segment_table.cellWidget(row, 2)
+        duration_sec = max(0.1, (new_end_ms - start_ms) / 1000.0)
+        if isinstance(sb, QDoubleSpinBox):
+            sb.blockSignals(True)
+            sb.setValue(duration_sec)
+            sb.blockSignals(False)
+            if requested_end_ms != new_end_ms:
+                sb.setStyleSheet("background-color: #fff3cd; font-weight: bold; color: #856404;")
+                sb.setToolTip("Clamped to avoid overlapping the next subtitle row.")
+            elif duration_sec > 10.0:
+                sb.setStyleSheet("background-color: #fefcbf; font-weight: bold; color: #b7791f;")
+                sb.setToolTip("⚠️ Warning: Duration > 10s! (វែងខុសប្រក្រតី)")
+            else:
+                sb.setStyleSheet("background-color: #ebf8ff;")
+                sb.setToolTip("Adjust duration with millisecond precision (កំណត់រយៈពេលត្រឹម 0.001s)")
+
+        self._clear_generated_audio_row(row)
+        return new_end_ms
+
+    def get_segment_times(self, row: int) -> tuple[int, int]:
+        item_start = self.segment_table.item(row, 0)
+        item_end = self.segment_table.item(row, 1)
+        start_ms = int(item_start.data(QT_USER_ROLE) or 0) if item_start else 0
+        end_ms = int(item_end.data(QT_USER_ROLE) or start_ms + 100) if item_end else start_ms + 100
+        return start_ms, end_ms
+
+    def update_segment_start_time(self, row: int, requested_start_ms: int) -> int:
+        item_start = self.segment_table.item(row, 0)
+        item_end = self.segment_table.item(row, 1)
+        if not item_start or not item_end:
+            return requested_start_ms
+        end_ms = int(item_end.data(QT_USER_ROLE) or 0)
+        max_start_ms = max(0, end_ms - 100)
+        new_start_ms = max(0, min(requested_start_ms, max_start_ms))
+        prev_row = row - 1
+        if prev_row >= 0:
+            prev_end_item = self.segment_table.item(prev_row, 1)
+            if prev_end_item:
+                prev_end = int(prev_end_item.data(QT_USER_ROLE) or 0)
+                new_start_ms = max(new_start_ms, prev_end)
+        item_start.setText(self.ms_to_time(new_start_ms))
+        item_start.setData(QT_USER_ROLE, new_start_ms)
+        sb = self.segment_table.cellWidget(row, 2)
+        if isinstance(sb, QDoubleSpinBox):
+            sb.blockSignals(True)
+            sb.setValue(max(0.1, (end_ms - new_start_ms) / 1000.0))
+            sb.blockSignals(False)
+        self._clear_generated_audio_row(row)
+        return new_start_ms
+
+    def move_segment_time(self, row: int, requested_start_ms: int) -> tuple[int, int]:
+        start_ms, end_ms = self.get_segment_times(row)
+        duration = max(100, end_ms - start_ms)
+        new_start = max(0, requested_start_ms)
+        if row > 0:
+            prev_end_item = self.segment_table.item(row - 1, 1)
+            if prev_end_item:
+                new_start = max(new_start, int(prev_end_item.data(QT_USER_ROLE) or 0))
+        if row + 1 < self.segment_table.rowCount():
+            next_start_item = self.segment_table.item(row + 1, 0)
+            if next_start_item:
+                next_start = int(next_start_item.data(QT_USER_ROLE) or 0)
+                new_start = min(new_start, max(0, next_start - duration))
+        item_start = self.segment_table.item(row, 0)
+        item_end = self.segment_table.item(row, 1)
+        if item_start and item_end:
+            item_start.setText(self.ms_to_time(new_start))
+            item_start.setData(QT_USER_ROLE, new_start)
+            item_end.setText(self.ms_to_time(new_start + duration))
+            item_end.setData(QT_USER_ROLE, new_start + duration)
+        self._clear_generated_audio_row(row)
+        return new_start, new_start + duration
+
     def on_crop_preset_changed(self):
         if self.sb_crop_top is None or self.sb_crop_bottom is None:
             return
@@ -5818,16 +9136,16 @@ except Exception:
         voice = self.get_voice_from_role(role)
     
         # Base values from config + manual offset
-        rate_val = config.get("rate", 0) + speed_offset
-        pitch_val = config.get("tts_pitch", 0)
+        rate_val = coerce_int(config.get("rate"), 0) + coerce_int(speed_offset, 0)
+        pitch_val = coerce_int(config.get("tts_pitch"), 0)
     
         # Age & Emotion Logic
         age = config.get("age", "")
         emotion = config.get("emotion", "")
     
-        if "Child" in age: pitch_val += 25; rate_val += 10
-        elif "Teen" in age: pitch_val += 10; rate_val += 5
-        elif "Elder" in age: pitch_val -= 15; rate_val -= 10
+        if "Child" in age or "កុមារ" in age or "ក្មេង" in age: pitch_val += 25; rate_val += 10
+        elif "Teen" in age or "យុវ" in age: pitch_val += 10; rate_val += 5
+        elif "Elder" in age or "ចាស់" in age or "ជរា" in age: pitch_val -= 15; rate_val -= 10
         
         if "Happy" in emotion: pitch_val += 5; rate_val += 10
         elif "Sad" in emotion: pitch_val -= 5; rate_val -= 15
@@ -5903,21 +9221,53 @@ except Exception:
 
     def log(self, message: str) -> None:
         self.log_signal.emit(message)
+    def _set_main_stop_button(self, active: bool, text: str = "Stop") -> None:
+        if not hasattr(self, "btn_stop_srt"):
+            return
+        self.btn_stop_srt.setText(text)
+        self.btn_stop_srt.setVisible(active)
+        self.btn_stop_srt.setEnabled(active)
+
     def on_tts_finished(self) -> None:
         self.btn_generate.setEnabled(True) # type: ignore
         self.progress.setValue(100)
     def on_srt_finished(self): # This method was correctly indented
         self.btn_srt.setEnabled(True)
         self.btn_run_srt.setEnabled(True)
-        self.btn_stop_srt.setEnabled(False)
+        self._set_main_stop_button(False)
         self.btn_export_wav.setEnabled(True)
+        self.btn_timeline_audio.setEnabled(True)
+        if hasattr(self, "btn_stop_gemini_transcribe"):
+            self.btn_stop_gemini_transcribe.setVisible(False)
+            self.btn_stop_gemini_transcribe.setEnabled(False)
+            self.btn_stop_gemini_transcribe.setText("Stop Transcribing")
+            self.btn_stop_gemini_transcribe.setToolTip("Stop the current Gemini transcribe/translate job")
+            try:
+                self.btn_stop_gemini_transcribe.clicked.disconnect()
+            except TypeError:
+                pass
+            self.btn_stop_gemini_transcribe.clicked.connect(self._stop_gemini_job)
         self.progress.setValue(100)
+        self._refresh_timeline()
         if hasattr(self, 'export_progress'): # type: ignore
             self.export_progress.setValue(100)
     def on_export_finished(self) -> None:
         if getattr(self, "merge_in_progress", False):
             return
         self.btn_export_mp4.setEnabled(True) # type: ignore
+        self.btn_run_srt.setEnabled(True)
+        self.btn_timeline_audio.setEnabled(True)
+        self.btn_export_wav.setEnabled(True)
+        if hasattr(self, "btn_stop_gemini_transcribe"):
+            self.btn_stop_gemini_transcribe.setVisible(False)
+            self.btn_stop_gemini_transcribe.setEnabled(False)
+            self.btn_stop_gemini_transcribe.setText("Stop Transcribing")
+            self.btn_stop_gemini_transcribe.setToolTip("Stop the current Gemini transcribe/translate job")
+            try:
+                self.btn_stop_gemini_transcribe.clicked.disconnect()
+            except TypeError:
+                pass
+            self.btn_stop_gemini_transcribe.clicked.connect(self._stop_gemini_job)
         self.export_progress.setValue(100)
         # Also update Home tab progress bar (they share the same export process)
         if hasattr(self, 'progress'): # type: ignore
@@ -5930,7 +9280,10 @@ except Exception:
     def stop_processing(self) -> None:
         self.stop_event.set()
         self.log("🛑 Stopping process... Please wait for current tasks to finish.")
-        self.btn_stop_srt.setEnabled(False)
+        self._set_main_stop_button(False, "Stopping...")
+        if hasattr(self, "btn_stop_gemini_transcribe") and self.btn_stop_gemini_transcribe.isVisible():
+            self.btn_stop_gemini_transcribe.setText("Stopping...")
+            self.btn_stop_gemini_transcribe.setEnabled(False)
     def generate_tts(self): # This method was correctly indented # type: ignore
         text = self.text_input.toPlainText()
         if not text:
@@ -5954,7 +9307,7 @@ except Exception:
         # type: ignore
         auto_play = self.chk_autoplay.isChecked()
         # Run in a separate thread to keep UI responsive
-        self.start_worker_thread(target=self.run_tts_thread, args=(text, voice_short, rate_str, pitch_str, fade_in, fade_out, ffmpeg_bin, output_file, auto_play))
+        self.start_worker_thread(target=self.run_tts_thread, args=(text, voice_short, rate_str, pitch_str, fade_in, fade_out, ffmpeg_bin, output_file, auto_play, role_name))
 
     def get_row_for_sender(self) -> Optional[int]:
         """Finds the table row for the widget that sent the signal."""
@@ -5976,6 +9329,16 @@ except Exception:
     def handle_play_video_button(self) -> None:
         row = self.get_row_for_sender() # type: ignore
         if row is not None:
+            audio_info = getattr(self, "generated_audio_segments", {}).get(row, {})
+            audio_path = str(audio_info.get("path", "") or "")
+            if audio_path and os.path.exists(audio_path):
+                start = int(audio_info.get("start", 0) or 0)
+                end = int(audio_info.get("end", start) or start)
+                self.segment_end_time = self._qt_int_ms(end, "generated row preview end")
+                self.media_player.setPosition(self._qt_int_ms(start, "generated row preview seek"))
+                self._start_generated_dub_preview()
+                self.media_player.play()
+                return
             self.play_video_segment(row)
 
     def handle_test_tts_button(self) -> None:
@@ -5995,25 +9358,37 @@ except Exception:
 
     def create_action_widget(self) -> QWidget:
         action_widget = QWidget() # type: ignore
-        action_layout = QHBoxLayout(action_widget)
+        action_layout = QVBoxLayout(action_widget)
         action_layout.setContentsMargins(2, 2, 2, 2)
         action_layout.setSpacing(2)
+        buttons_row = QHBoxLayout()
+        buttons_row.setContentsMargins(0, 0, 0, 0)
+        buttons_row.setSpacing(2)
 
-        btn_play_orig = QPushButton("▶ Video")
+        btn_play_orig = QPushButton("Play")
+        btn_play_orig.setToolTip("Preview generated audio for this row when available; otherwise preview the original video segment")
+        btn_play_orig.setFixedSize(42, 25)
         btn_play_orig.setStyleSheet("""
             QPushButton {
-                background-color: #ed8936;
+                background-color: #f97316;
                 color: white;
+                border-radius: 4px;
+                font-size: 8pt;
+                font-weight: 700;
             }
         """) # type: ignore
         btn_play_orig.clicked.connect(self.handle_play_video_button) # type: ignore
     
-        btn_test_tts = QPushButton("Test TTS")
+        btn_test_tts = QPushButton("TTS")
+        btn_test_tts.setToolTip("Preview generated TTS for this row")
+        btn_test_tts.setFixedSize(38, 25)
         btn_test_tts.setStyleSheet("""
             QPushButton {
                 background-color: #2b6cb0;
                 color: white;
                 font-weight: bold;
+                border-radius: 4px;
+                font-size: 8pt;
             }
             QPushButton:hover {
                 background-color: #2c5282;
@@ -6021,30 +9396,67 @@ except Exception:
         """)
         btn_test_tts.clicked.connect(self.handle_test_tts_button)
 
-        btn_gen_tts = QPushButton("Gen TTS")
+        btn_gen_tts = QPushButton("Gen")
+        btn_gen_tts.setToolTip("Generate TTS for this row")
+        btn_gen_tts.setFixedSize(38, 25)
         btn_gen_tts.setStyleSheet("""
             QPushButton {
                 background-color: #38a169;
                 color: white;
                 font-weight: bold;
+                border-radius: 4px;
+                font-size: 8pt;
             }
             QPushButton:hover {
                 background-color: #2f855a;
             }
         """)
+        btn_gen_tts.clicked.connect(self.handle_gen_tts_button)
     
-        action_layout.addWidget(btn_play_orig)
-        action_layout.addWidget(btn_test_tts) # type: ignore
-        action_layout.addWidget(btn_gen_tts)
+        buttons_row.addWidget(btn_play_orig)
+        buttons_row.addWidget(btn_test_tts) # type: ignore
+        buttons_row.addWidget(btn_gen_tts)
     
         # Add Delete Button
-        btn_del = QPushButton("❌")
-        btn_del.setFixedWidth(30)
-        btn_del.setStyleSheet("background-color: #e53e3e; font-weight: bold;")
+        btn_del = QPushButton("Del")
+        btn_del.setToolTip("Delete this subtitle row")
+        btn_del.setFixedSize(38, 25)
+        btn_del.setStyleSheet("background-color: #dc2626; color: white; border-radius: 4px; font-size: 8pt; font-weight: 700;")
         btn_del.clicked.connect(self.handle_delete_button)
-        action_layout.addWidget(btn_del) # type: ignore
+        buttons_row.addWidget(btn_del) # type: ignore
+
+        status_label = QLabel("Ready")
+        status_label.setObjectName("audioStatusLabel")
+        status_label.setAlignment(Qt.AlignCenter)
+        status_label.setFixedHeight(18)
+        status_label.setStyleSheet("background-color: #eef2ff; color: #4338ca; border-radius: 4px; font-size: 8pt; font-weight: 700;")
+        action_layout.addLayout(buttons_row)
+        action_layout.addWidget(status_label)
     
         return action_widget
+
+    def _audio_status_label_for_row(self, row: int) -> Optional[QLabel]:
+        widget = self.segment_table.cellWidget(row, 5) if hasattr(self, "segment_table") else None
+        if not widget:
+            return None
+        label = widget.findChild(QLabel, "audioStatusLabel")
+        return label if isinstance(label, QLabel) else None
+
+    def set_row_audio_status(self, row: int, status: str, state: str = "ready") -> None:
+        label = self._audio_status_label_for_row(row)
+        if not label:
+            return
+        colors = {
+            "ready": ("#eef2ff", "#4338ca"),
+            "queued": ("#fef3c7", "#92400e"),
+            "generating": ("#dbeafe", "#1d4ed8"),
+            "done": ("#dcfce7", "#166534"),
+            "failed": ("#fee2e2", "#991b1b"),
+            "stopped": ("#f1f5f9", "#475569"),
+        }
+        bg, fg = colors.get(state, colors["ready"])
+        label.setText(status)
+        label.setStyleSheet(f"background-color: {bg}; color: {fg}; border-radius: 4px; font-size: 8pt; font-weight: 700;")
 
     def delete_segment(self, row: int) -> None:
         # This is now a very fast operation, as it no longer needs to # type: ignore
@@ -6054,6 +9466,7 @@ except Exception:
     
         # Now remove the row (widgets already scheduled for deletion)
         self.segment_table.removeRow(row)
+        self._refresh_timeline()
 
     def load_dual_srt(self) -> None:
         """
@@ -6159,13 +9572,9 @@ except Exception:
                 
                     # ១. ចាប់យកតួអង្គដោយស្វ័យប្រវត្តិ (Automatic Speaker Detection)
                     detected_role: str = "Unknown" # type: ignore
-                    clean_text = translated_text
-                
-                    # ស្វែងរក Pattern ដូចជា [ប្រុស, យុវវ័យ]
-                    match = re.search(r'^\[(.*?)\]', translated_text)
-                    if match:
-                        detected_role = normalize_role_name(match.group(1).strip())
-                        clean_text = translated_text.replace(match.group(0), "").strip()
+                    parsed_role, clean_text = self._extract_role_and_dialogue_for_tts(translated_text)
+                    if parsed_role:
+                        detected_role = parsed_role
                 
                     # ២. កំណត់ពណ៌តាមតួអង្គ (Character Color Assignment) # type: ignore
                     if detected_role not in role_colors:
@@ -6230,6 +9639,7 @@ except Exception:
             self.voice_combo.blockSignals(True)
             self._refresh_voice_combo(current_voice)
             self.voice_combo.blockSignals(False)
+            self._refresh_tts_scope_roles()
 
             self.btn_run_srt.setEnabled(True) # type: ignore
         
@@ -6251,6 +9661,7 @@ except Exception:
                     f"ℹ️ មាន {index_fallback_count} បន្ទាត់បានយកអត្ថបទតាមលំដាប់បន្ទាត់។ នាទីនៅតែយកពី CapCut file ដើម។"
                 )
             self.progress.setValue(100) # type: ignore
+            self._refresh_timeline()
 
         except Exception as e:
             # No need to re-enable updates here - finally block already did it
@@ -6322,6 +9733,7 @@ except Exception:
         self.segment_table.insertRow(row)
     
         self.set_table_row(row, start_ms, end_ms, self.voice_combo.currentText(), text)
+        self._refresh_timeline()
         # type: ignore
     
     
@@ -6340,6 +9752,7 @@ except Exception:
         self.app_settings["last_srt_dir"] = os.path.dirname(srt_path)
         self.save_app_settings()
         self.current_srt_path = srt_path
+        self._clear_generated_audio_state()
         self.log(f"Loaded SRT: {srt_path}")
     
         try:
@@ -6371,13 +9784,9 @@ except Exception:
                 
                     # ១. ចាប់យកតួអង្គដោយស្វ័យប្រវត្តិ (Automatic Speaker Detection)
                     detected_role = "Unknown"
-                    clean_text = raw_text
-                
-                    # ស្វែងរក Pattern ដូចជា [ប្រុស, យុវវ័យ]
-                    match = re.search(r'^\[(.*?)\]', raw_text)
-                    if match:
-                        detected_role = normalize_role_name(match.group(1).strip())
-                        clean_text = raw_text.replace(match.group(0), "").strip() # type: ignore
+                    parsed_role, clean_text = self._extract_role_and_dialogue_for_tts(raw_text)
+                    if parsed_role:
+                        detected_role = parsed_role
                 
                     # ២. កំណត់ពណ៌តាមតួអង្គ (Character Color Assignment)
                     if detected_role not in role_colors:
@@ -6457,8 +9866,11 @@ except Exception:
             # Store character information globally for lip-sync and other features
             self.srt_characters = list(role_colors.keys())
             self.character_info = role_colors.copy()
+            if hasattr(self, "character_profiles_table"):
+                self._populate_character_profiles_table(self.srt_characters)
         
             self.progress.setValue(100) # type: ignore
+            self._refresh_timeline()
 
         except Exception as e:
             self.log(f"❌ Error reading SRT: {str(e)}")
@@ -6495,8 +9907,8 @@ except Exception:
                             self.log(f"⚠️ Segment starts before this video (Offset: {self.ms_to_time(offset)})")
                             return
 
-                    self.segment_end_time = end_pos
-                    self.media_player.setPosition(seek_pos)
+                    self.segment_end_time = self._qt_int_ms(end_pos, "segment end")
+                    self.media_player.setPosition(self._qt_int_ms(seek_pos, "segment seek"))
                     self.media_player.play()
         except Exception as e:
             self.log(f"Error playing video segment: {e}") # type: ignore
@@ -6518,7 +9930,7 @@ except Exception:
                     # Apply Offset (Fix for Test Video/TTS sync)
                     offset = self.get_offset_ms()
                     seek_pos = max(0, start_ms - offset) # type: ignore
-                    self.media_player.setPosition(seek_pos)
+                    self.media_player.setPosition(self._qt_int_ms(seek_pos, "row preview seek"))
         except:
             pass # type: ignore
         role_combo = self.segment_table.cellWidget(row, 3)
@@ -6537,12 +9949,20 @@ except Exception:
 
         # type: ignore
         self.log(f"Processing Row {row+1} [{action_type}] - Role: {role}") # type: ignore
+        self.set_row_audio_status(row, "Generating", "generating")
         self.start_worker_thread(target=self.process_row_action, args=(row, role, text, action_type, seek_pos, speed_val, ffmpeg_bin, global_fade_in, global_fade_out, output_dir, start_ms, end_ms))
 
     def on_play_audio(self, file_path, start_ms):
         """Play audio preview using pygame"""
         if start_ms >= 0 and self.media_player.state() != MEDIA_PLAYER_PLAYING:
-            self.media_player.setPosition(start_ms)
+            self.media_player.setPosition(self._qt_int_ms(start_ms, "audio preview seek"))
+            self.original_audio_muted = True
+            self.media_player.setMuted(True)
+            if hasattr(self, "btn_mute_original_audio"):
+                self.btn_mute_original_audio.blockSignals(True)
+                self.btn_mute_original_audio.setChecked(True)
+                self.btn_mute_original_audio.setText("Audio\nMuted")
+                self.btn_mute_original_audio.blockSignals(False)
             self.media_player.play() # type: ignore
 
         # Use pygame for audio preview
@@ -6569,6 +9989,8 @@ except Exception:
 
     def on_preview_state_changed(self, state): # type: ignore
         if state == MEDIA_PLAYER_STOPPED: # type: ignore
+            if getattr(self, "_dub_playback_enabled", False):
+                return
             self.media_player.pause() # type: ignore
 
     def force_stop_player(self) -> None:
@@ -6620,7 +10042,7 @@ except Exception:
             tts_text = text.replace("(", "").replace(")", "")
 
             # 2. Generate TTS Temp (thread-safe async)
-            self.run_async_in_thread(self.edge_tts_save(tts_text, voice, temp_tts, rate_str, pitch_str))
+            self.run_async_in_thread(self.tts_save(tts_text, voice, temp_tts, rate_str, pitch_str, role))
         
             if self.stop_event.is_set(): return
 
@@ -6667,9 +10089,9 @@ except Exception:
             final_segment = self.safe_load_audio(working_file, ffmpeg_bin) # type: ignore
 
             # Apply Fades (Per Character) in memory
-            c_fade_in = config.get("fade_in", -1)
+            c_fade_in = coerce_int(config.get("fade_in"), -1)
             final_fade_in = c_fade_in if c_fade_in != -1 else global_fade_in
-            c_fade_out = config.get("fade_out", -1)
+            c_fade_out = coerce_int(config.get("fade_out"), -1)
             final_fade_out = c_fade_out if c_fade_out != -1 else global_fade_out
         
             if final_fade_in > 0:
@@ -6686,21 +10108,39 @@ except Exception:
             if action_type == "test_tts":
                 final_segment.export(working_file, format="mp3")
                 self.play_audio_signal.emit(os.path.abspath(working_file), seek_pos) # type: ignore
+                self.audio_status_signal.emit(row, "Preview", "done")
         
             elif action_type == "gen_tts":
                 output_file_path = os.path.join(output_dir, f"row_{row+1}_tts.wav")
                 final_segment.export(output_file_path, format="wav")
                 self.log(f"✅ Saved: {output_file_path}")
+                self.audio_status_signal.emit(row, "Done", "done")
                 if os.path.exists(working_file):
                     os.remove(working_file)
             
         except Exception as e:
+            self.audio_status_signal.emit(row, "Failed", "failed")
             self.log(f"❌ Error in Row Action: {e}")
             traceback.print_exc() # type: ignore
 
-    def get_active_segments(self) -> list[dict[str, Union[str, int]]]:
+    def get_selected_segment_rows(self) -> list[int]:
+        if not hasattr(self, "segment_table"):
+            return []
+        checked_rows = []
+        for row in range(self.segment_table.rowCount()):
+            item = self.segment_table.item(row, 0)
+            if item and item.checkState() == Qt.Checked:
+                checked_rows.append(row)
+        if checked_rows:
+            return checked_rows
+        return sorted({index.row() for index in self.segment_table.selectedIndexes()})
+
+    def get_active_segments(self, selected_rows: Optional[set[int]] = None) -> list[dict[str, Union[str, int]]]:
         segments = self.get_segments_from_table()
         if not segments: return []
+        if selected_rows:
+            segments = [segment for segment in segments if int(segment.get("_row", -1)) in selected_rows]
+            self.log(f"🎯 Generate selected rows only: {len(segments)} row(s).")
 
         offset = self.get_offset_ms()
 
@@ -6712,7 +10152,137 @@ except Exception:
                 seg['start'] = max(0, seg['start'] - offset)
                 seg['end'] = max(0, seg['end'] - offset)
                 adjusted_segments.append(seg)
-            return adjusted_segments
+            segments = adjusted_segments
+        valid_segments = []
+        skipped_count = 0
+        for seg in segments:
+            text = str(seg.get("text", "")).strip()
+            start = int(seg.get("start", 0))
+            end = int(seg.get("end", 0))
+            if not text or end <= start:
+                skipped_count += 1
+                continue
+            valid_segments.append(seg)
+        if skipped_count:
+            self.log(f"⚠️ Skipped {skipped_count} empty or invalid-timing subtitle rows.")
+        return self._filter_tts_scope_segments(valid_segments)
+
+    def _refresh_tts_scope_roles(self) -> None:
+        if not hasattr(self, "tts_scope_role_combo"):
+            return
+        current = self.tts_scope_role_combo.currentText() or str(self.app_settings.get("tts_selected_character", ""))
+        tagged_roles = [role for role in self.roles if role and role != "Unknown"]
+        self.tts_scope_role_combo.blockSignals(True)
+        self.tts_scope_role_combo.clear()
+        self.tts_scope_role_combo.addItems(tagged_roles)
+        if current in tagged_roles:
+            self.tts_scope_role_combo.setCurrentText(current)
+        self.tts_scope_role_combo.blockSignals(False)
+        self._save_tts_scope_settings()
+
+    def _on_home_tts_engine_changed(self) -> None:
+        if not hasattr(self, "home_tts_engine_combo"):
+            return
+        use_voxcpm2 = self.home_tts_engine_combo.currentData() == "voxcpm2"
+        self.app_settings["voxcpm2_enabled"] = use_voxcpm2
+        if hasattr(self, "chk_voxcpm2_enabled"):
+            self.chk_voxcpm2_enabled.blockSignals(True)
+            self.chk_voxcpm2_enabled.setChecked(use_voxcpm2)
+            self.chk_voxcpm2_enabled.blockSignals(False)
+        self._sync_home_voxcpm2_controls()
+        if use_voxcpm2:
+            self._refresh_voxcpm2_speaker_profiles()
+        self.save_app_settings()
+        self.log(f"🔊 TTS engine: {'VoxCPM2 AI' if use_voxcpm2 else 'Standard Edge TTS'}")
+
+    def _sync_home_voxcpm2_controls(self) -> None:
+        if not hasattr(self, "home_voxcpm2_frame"):
+            return
+        use_voxcpm2 = bool(self.app_settings.get("voxcpm2_enabled", False))
+        if hasattr(self, "home_tts_engine_combo"):
+            self.home_tts_engine_combo.blockSignals(True)
+            self.home_tts_engine_combo.setCurrentIndex(1 if use_voxcpm2 else 0)
+            self.home_tts_engine_combo.blockSignals(False)
+        self.home_voxcpm2_frame.setVisible(use_voxcpm2)
+        if hasattr(self, "home_voxcpm2_voice_mode_combo"):
+            mode = self.app_settings.get("voxcpm2_voice_mode", "all")
+            index = self.home_voxcpm2_voice_mode_combo.findData(mode)
+            self.home_voxcpm2_voice_mode_combo.blockSignals(True)
+            self.home_voxcpm2_voice_mode_combo.setCurrentIndex(max(0, index))
+            self.home_voxcpm2_voice_mode_combo.blockSignals(False)
+        if hasattr(self, "home_voxcpm2_speaker_combo"):
+            selected = str(self.app_settings.get("voxcpm2_default_speaker", "") or "Default")
+            self.home_voxcpm2_speaker_combo.blockSignals(True)
+            if self.home_voxcpm2_speaker_combo.findText(selected) < 0:
+                self.home_voxcpm2_speaker_combo.addItem(selected)
+            self.home_voxcpm2_speaker_combo.setCurrentText(selected)
+            self.home_voxcpm2_speaker_combo.blockSignals(False)
+
+    def _on_home_voxcpm2_controls_changed(self) -> None:
+        if hasattr(self, "home_voxcpm2_voice_mode_combo"):
+            self.app_settings["voxcpm2_voice_mode"] = self.home_voxcpm2_voice_mode_combo.currentData()
+            if hasattr(self, "voxcpm2_voice_mode_combo"):
+                self.voxcpm2_voice_mode_combo.blockSignals(True)
+                index = self.voxcpm2_voice_mode_combo.findData(self.home_voxcpm2_voice_mode_combo.currentData())
+                self.voxcpm2_voice_mode_combo.setCurrentIndex(max(0, index))
+                self.voxcpm2_voice_mode_combo.blockSignals(False)
+        if hasattr(self, "home_voxcpm2_speaker_combo"):
+            self.app_settings["voxcpm2_default_speaker"] = self.home_voxcpm2_speaker_combo.currentText().strip()
+            if hasattr(self, "voxcpm2_speaker_combo"):
+                selected = self.home_voxcpm2_speaker_combo.currentText().strip()
+                self.voxcpm2_speaker_combo.blockSignals(True)
+                if self.voxcpm2_speaker_combo.findText(selected) < 0:
+                    self.voxcpm2_speaker_combo.addItem(selected)
+                self.voxcpm2_speaker_combo.setCurrentText(selected)
+                self.voxcpm2_speaker_combo.blockSignals(False)
+        self.save_app_settings()
+
+    def _toggle_manual_segment_entry(self, checked: bool) -> None:
+        if not hasattr(self, "manual_entry_frame"):
+            return
+        self.manual_entry_frame.setVisible(checked)
+        self.btn_toggle_manual_segment.setText("－ Segment" if checked else "＋ Segment")
+        if hasattr(self, "home_controls_scroll_area"):
+            self.home_controls_scroll_area.setMaximumHeight(260 if checked else 200)
+        if checked:
+            self.manual_text.setFocus()
+
+    def _on_auto_fit_setting_changed(self, checked: bool) -> None:
+        self.app_settings["auto_fit"] = bool(checked)
+        self.save_app_settings()
+
+    def _on_tts_scope_changed(self) -> None:
+        if not hasattr(self, "tts_scope_combo"):
+            return
+        selected_only = self.tts_scope_combo.currentData() == "selected"
+        self.tts_scope_role_combo.setVisible(selected_only)
+        if selected_only:
+            self.tts_scope_note.setText("Generate only rows tagged with the selected character.")
+        else:
+            self.tts_scope_note.setText("Generate every subtitle row, including untagged SRT text.")
+        self._save_tts_scope_settings()
+
+    def _save_tts_scope_settings(self) -> None:
+        if not hasattr(self, "tts_scope_combo"):
+            return
+        self.app_settings["tts_character_scope"] = self.tts_scope_combo.currentData()
+        self.app_settings["tts_selected_character"] = self.tts_scope_role_combo.currentText()
+        self.save_app_settings()
+
+    def _filter_tts_scope_segments(self, segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not hasattr(self, "tts_scope_combo"):
+            return segments
+        scope = self.tts_scope_combo.currentData()
+        if scope == "selected":
+            selected_role = self.tts_scope_role_combo.currentText()
+            selected_role_normalized = normalize_role_name(selected_role)
+            filtered = [
+                segment for segment in segments
+                if normalize_role_name(str(segment.get("role", ""))) == selected_role_normalized
+            ]
+            self.log(f"🎭 TTS scope: {selected_role or 'No character selected'} ({len(filtered)} rows)")
+            return filtered
+        self.log(f"🎭 TTS scope: all subtitle rows ({len(segments)} rows)")
         return segments
 
     def get_segments_from_table(self) -> list[dict[str, Any]]:
@@ -6738,6 +10308,11 @@ except Exception:
         
             item_text = self.segment_table.item(r, 4)
             text = item_text.text() if item_text else ""
+            parsed_role, clean_text = self._extract_role_and_dialogue_for_tts(text)
+            if parsed_role and (not role or role == "Unknown"):
+                role = parsed_role
+            if clean_text:
+                text = clean_text
         
             # Fix: If Auto-Fit is checked, ignore global speed to ensure accurate base duration
             # (ជួសជុល៖ បើប្រើ Auto-Fit ត្រូវបិទ Global Speed ដើម្បីអោយការគណនារយៈពេលត្រឹមត្រូវ)
@@ -6746,34 +10321,37 @@ except Exception:
 
             # Resolve Fade
             config = self.role_configs.get(role, {})
-            c_fade_in = config.get("fade_in", -1)
+            c_fade_in = coerce_int(config.get("fade_in"), -1)
             final_fade_in = c_fade_in if c_fade_in != -1 else global_fade_in
         
-            c_fade_out = config.get("fade_out", -1) # type: ignore
+            c_fade_out = coerce_int(config.get("fade_out"), -1) # type: ignore
             final_fade_out = c_fade_out if c_fade_out != -1 else global_fade_out
 
             segments.append({
                 "text": text,
+                "role": role,
                 "voice": voice,
                 "rate": rate_str,
                 "pitch": pitch_str,
                 "start": start_ms,
                 "end": end_ms,
                 "fade_in": final_fade_in,
-                "fade_out": final_fade_out
+                "fade_out": final_fade_out,
+                "_row": r,
             })
         return segments
 
-    async def batch_generate_tts(self, tasks: list[tuple[str, str, str, str, str]]) -> None:
+    async def batch_generate_tts(self, tasks: list[tuple[str, str, str, str, str, str]]) -> None:
         # Edge TTS has strict rate limits, especially for batch exports # type: ignore
-        max_concurrent = min(3, max(1, len(tasks) // 10))  # Dynamic: 1-3 based on task count
+        max_concurrent = 1 if self.app_settings.get("voxcpm2_enabled", False) else min(3, max(1, len(tasks) // 10))
         semaphore = asyncio.Semaphore(max_concurrent)
+        failures = []
 
         self.log(f"🔧 Using {max_concurrent} concurrent TTS workers (rate-limited)")
 
         async def worker(task):
             if self.stop_event.is_set(): return
-            text, voice, filename, rate, pitch = task
+            text, voice, filename, rate, pitch, role = task
             # Add jitter to prevent thundering herd
             await asyncio.sleep(random.uniform(0.5, 2.0)) # type: ignore
             async with semaphore:
@@ -6781,12 +10359,15 @@ except Exception:
                 for attempt in range(retries):
                     try: # type: ignore
                         if self.stop_event.is_set(): return
-                        communicate = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch)
-                        await communicate.save(filename)
+                        await self.tts_save(text, voice, filename, rate, pitch, role)
                         # Fix Bug #14: Increase delay after success to respect rate limits
                         await asyncio.sleep(random.uniform(0.5, 1.5)) # type: ignore
                         return
                     except Exception as e:
+                        if "is not in the list of choices" in str(e):
+                            self.log(f"❌ VoxCPM2 configuration error for {filename}: {e}")
+                            failures.append((filename, str(e)))
+                            return
                         if attempt < retries - 1:
                             # Exponential backoff + jitter
                             wait_time = (2 ** attempt) + random.uniform(2, 5)
@@ -6794,8 +10375,13 @@ except Exception:
                             await asyncio.sleep(wait_time)
                         else:
                             self.log(f"❌ Error gen {filename}: {e}")
+                            failures.append((filename, str(e)))
 
         await asyncio.gather(*(worker(t) for t in tasks))
+        if failures:
+            failed_names = ", ".join(os.path.basename(filename) for filename, _error in failures[:5])
+            more = f" and {len(failures) - 5} more" if len(failures) > 5 else ""
+            raise RuntimeError(f"{len(failures)} TTS segment(s) failed: {failed_names}{more}")
 
     def safe_load_audio(self, filepath: str, ffmpeg_bin: str) -> AudioSegment: # type: ignore
         """
@@ -6847,7 +10433,7 @@ except Exception:
         collected = gc.collect()
 
         # 2. Remove temp files (Fix Bug #17: Skip files in use)
-        patterns = ["temp_*.mp3", "temp_*.wav", "*.temp.wav"]
+        patterns = ["temp_preview_*", "temp_gen_*"]
         removed_count = 0
         failed_count = 0
         for pattern in patterns:
@@ -6876,16 +10462,43 @@ except Exception:
 
     def run_srt_conversion(self) -> None:
         self.clear_cache() # Clean before starting
-        segments = self.get_active_segments()
+        selected_rows = set(self.get_selected_segment_rows())
+        segments = self.get_active_segments(selected_rows or None)
         if not segments:
             QMessageBox.warning(self, "Warning", "No segments to process! (Check Table or Offset)")
             return
 
-        self.log(f"Processing {len(segments)} segments from table...")
+        if selected_rows:
+            self.log(f"Processing {len(segments)} selected segment(s) from table...")
+        else:
+            self.log(f"Processing {len(segments)} segments from table...")
+        self.last_generated_audio = None
+        rows_to_generate = {int(segment.get("_row", -1)) for segment in segments if int(segment.get("_row", -1)) >= 0}
+        if rows_to_generate:
+            for row in rows_to_generate:
+                self.generated_audio_segments.pop(row, None)
+                self.set_row_audio_status(row, "Queued", "queued")
+        else:
+            self.generated_audio_segments = {}
+            for row in range(self.segment_table.rowCount()):
+                self.set_row_audio_status(row, "Queued", "queued")
+        self._refresh_timeline()
         self.stop_event.clear()
         self.btn_run_srt.setEnabled(False) # type: ignore
         self.btn_srt.setEnabled(False)
-        self.btn_stop_srt.setEnabled(True)
+        self._set_main_stop_button(True, "Stop Generating")
+        if hasattr(self, "btn_stop_gemini_transcribe"):
+            self.btn_stop_gemini_transcribe.setText("Stop Generating")
+            self.btn_stop_gemini_transcribe.setToolTip("Stop the current audio generation job")
+            self.btn_stop_gemini_transcribe.setVisible(True)
+            self.btn_stop_gemini_transcribe.setEnabled(True)
+            try:
+                self.btn_stop_gemini_transcribe.clicked.disconnect()
+            except TypeError:
+                pass
+            self.btn_stop_gemini_transcribe.clicked.connect(self.stop_processing)
+        self.btn_timeline_audio.setEnabled(False)
+        self.btn_export_wav.setEnabled(False)
     
         ffmpeg_bin = self.get_ffmpeg()
         auto_fit = self.chk_auto_fit.isChecked()
@@ -6898,9 +10511,13 @@ except Exception:
         output_dir = self.get_output_dir()
         output_file = os.path.join(output_dir, "srt_output.wav")
     
-        self.start_worker_thread(target=self.run_srt_thread, args=(segments, ffmpeg_bin, output_file, 0, auto_fit, fade_in, fade_out))
+        self.start_worker_thread(
+            target=self.run_srt_thread,
+            args=(segments, ffmpeg_bin, output_file, 0, auto_fit, fade_in, fade_out, False, True, True)
+        )
 
-    def run_srt_thread(self, segments: list[dict[str, Any]], ffmpeg_bin: str, output_file: str = "srt_output.wav", quality_idx: int = 0, auto_fit: bool = True, fade_in: int = 0, fade_out: int = 0, auto_play: bool = True, emit_signal: bool = True) -> None:
+    def run_srt_thread(self, segments: list[dict[str, Any]], ffmpeg_bin: str, output_file: str = "srt_output.wav", quality_idx: int = 0, auto_fit: bool = True, fade_in: int = 0, fade_out: int = 0, auto_play: bool = True, emit_signal: bool = True, individual_clips: bool = False) -> None:
+        work_dir = tempfile.mkdtemp(prefix="srt_drama_audio_")
         try:
             # Configure FFmpeg for Pydub
             self._configure_audio_converter(ffmpeg_bin)
@@ -6914,17 +10531,20 @@ except Exception:
             segments.sort(key=lambda x: x['start'])
         
             tasks = []
-            temp_map = [] # (index, filename, start_ms)
+            temp_map = [] # (index, filename, start_ms, row)
             segments_map = {} # Store segment info for duration check
         
             for i, seg in enumerate(segments):
                 text = seg['text']
                 if not text or not text.strip(): continue
             
-                temp_file = f"temp_{i}.mp3"
-                tasks.append((text, seg['voice'], temp_file, seg['rate'], seg['pitch'])) # type: ignore
-                temp_map.append((i, temp_file, seg['start']))
+                temp_file = os.path.join(work_dir, f"segment_{i}.mp3")
+                tasks.append((text, seg['voice'], temp_file, seg['rate'], seg['pitch'], seg.get('role', ''))) # type: ignore
+                temp_map.append((i, temp_file, seg['start'], seg.get('_row')))
                 segments_map[i] = seg
+                row = seg.get("_row")
+                if row is not None:
+                    self.audio_status_signal.emit(int(row), "Generating", "generating")
 
             if self.stop_event.is_set(): return
 
@@ -6934,17 +10554,30 @@ except Exception:
         
             if self.stop_event.is_set():
                 self.log("🛑 Process stopped by user.")
+                for _i, _temp_file, _start_ms, row in temp_map:
+                    if row is not None:
+                        self.audio_status_signal.emit(int(row), "Stopped", "stopped")
                 return
 
+            missing_files = [t_file for _i, t_file, _start_ms, _row in temp_map if not os.path.exists(t_file) or os.path.getsize(t_file) < 100]
+            if missing_files:
+                missing_lookup = set(missing_files)
+                for _i, t_file, _start_ms, row in temp_map:
+                    if row is not None and t_file in missing_lookup:
+                        self.audio_status_signal.emit(int(row), "Failed", "failed")
+                sample = ", ".join(os.path.basename(path) for path in missing_files[:5])
+                more = f" and {len(missing_files) - 5} more" if len(missing_files) > 5 else ""
+                raise RuntimeError(f"TTS generation did not create {len(missing_files)} audio file(s): {sample}{more}")
+
             # 3. Assemble Audio
-            self.log("🧩 Assembling audio tracks...") # type: ignore
+            self.log("✂️ Saving short audio clips per subtitle row..." if individual_clips else "🧩 Assembling audio tracks...") # type: ignore
             max_end = max(s['end'] for s in segments) # type: ignore
             total_duration = max_end + 3000 # +3s buffer
         
             # FIX: Detect frame rate to prevent low-quality downsampling (11kHz bug)
             # កំណត់ Frame Rate ឱ្យត្រូវនឹងសំឡេងដើម (44100Hz) ដើម្បីកុំឱ្យសំឡេងខូចគុណភាព
             target_rate = 44100
-            for _, t_file, _ in temp_map:
+            for _, t_file, _, _row in temp_map:
                 if os.path.exists(t_file): # type: ignore
                     try: # type: ignore
                         probe = self.safe_load_audio(t_file, ffmpeg_bin)
@@ -6954,16 +10587,22 @@ except Exception:
                         break
                     except: pass
         
-            final_audio = AudioSegment.silent(duration=total_duration, frame_rate=target_rate) # type: ignore
+            final_audio = None if individual_clips else AudioSegment.silent(duration=total_duration, frame_rate=target_rate) # type: ignore
+            clip_dir = os.path.join(self.get_output_dir(), "generated_segments")
+            if individual_clips:
+                os.makedirs(clip_dir, exist_ok=True)
         
         # type: ignore
-            for i, temp_file, start_ms in temp_map:
+            generated_audio_segments = {}
+            for i, temp_file, start_ms, row in temp_map:
                 if self.stop_event.is_set(): break
 
                 if os.path.exists(temp_file): # type: ignore
                     try:
                         if os.path.getsize(temp_file) < 100:
                             self.log(f"⚠️ Segment {i+1} skipped: File too small/empty.")
+                            if row is not None:
+                                self.audio_status_signal.emit(int(row), "Failed", "failed")
                             continue
                         
                         # type: ignore
@@ -7012,7 +10651,7 @@ except Exception:
                                     temp_t /= 0.5
                                 filter_chain += f"atempo={temp_t}" # type: ignore
                             
-                                processed_file = f"temp_fit_{i}.wav"
+                                processed_file = os.path.join(work_dir, f"segment_fit_{i}.wav")
                                 cmd = [ffmpeg_bin, "-y", "-i", temp_file, "-filter:a", filter_chain, processed_file]
                                 # Capture stderr to log if it fails
                                 res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform=="win32" else 0)
@@ -7041,21 +10680,52 @@ except Exception:
                     
                         # Adjust position to compensate for padding (កែសម្រួលម៉ោងវិញ)
                         adj_start = max(0, start_ms - pad_ms)
-                        final_audio = final_audio.overlay(segment, position=adj_start)
+                        if final_audio is not None:
+                            final_audio = final_audio.overlay(segment, position=adj_start)
+                        if row is not None:
+                            clip_path = ""
+                            if individual_clips:
+                                clip_path = os.path.join(clip_dir, f"row_{int(row) + 1:04d}_{int(seg_info.get('start', start_ms)) if seg_info else int(start_ms)}_{int(seg_info.get('end', start_ms + len(segment))) if seg_info else int(start_ms + len(segment))}.wav")
+                                segment.export(clip_path, format="wav")
+                            generated_audio_segments[int(row)] = {
+                                "duration": len(segment),
+                                "start": int(seg_info.get("start", start_ms)) if seg_info else int(start_ms),
+                                "end": int(seg_info.get("end", start_ms + len(segment))) if seg_info else int(start_ms + len(segment)),
+                                "path": clip_path,
+                            }
                         os.remove(temp_file)
+                        if row is not None:
+                            self.audio_status_signal.emit(int(row), "Done", "done")
                     except Exception as e: # type: ignore
                         self.log(f"⚠️ Error overlaying segment {i}: {e}")
+                        if row is not None:
+                            self.audio_status_signal.emit(int(row), "Failed", "failed")
                 else:
                     self.log(f"⚠️ Segment {i+1} missing: Audio generation failed.")
+                    if row is not None:
+                        self.audio_status_signal.emit(int(row), "Failed", "failed")
             
                 progress = int((i + 1) / len(segments) * 100)
                 self.progress_signal.emit(progress)
 
             if self.stop_event.is_set():
                 self.log("🛑 Process stopped. Audio not saved.") # type: ignore
+                for _i, _temp_file, _start_ms, row in temp_map:
+                    if row is not None:
+                        self.audio_status_signal.emit(int(row), "Stopped", "stopped")
+                return
+
+            if individual_clips:
+                merged_audio_segments = dict(getattr(self, "generated_audio_segments", {}))
+                merged_audio_segments.update(generated_audio_segments)
+                self.generated_audio_segments = merged_audio_segments
+                self.last_generated_audio = None
+                self.log(f"✅ Saved {len(generated_audio_segments)} short audio clip(s). Final Render will merge them.")
                 return
 
             # 4. Export with Quality # type: ignore
+            if final_audio is None:
+                raise RuntimeError("No merged audio was assembled.")
             fmt = "wav"
             bitrate = None
         
@@ -7071,19 +10741,29 @@ except Exception:
             final_audio.export(output_file, format=fmt, bitrate=bitrate) # type: ignore
         
             self.last_generated_audio = output_file # រក្សាទុកឈ្មោះ File សម្រាប់ Export Video
+            merged_audio_segments = dict(getattr(self, "generated_audio_segments", {}))
+            merged_audio_segments.update(generated_audio_segments)
+            self.generated_audio_segments = merged_audio_segments
         
             self.log(f"✅ SRT Audio Generated: {output_file}")
-            if auto_play and sys.platform == "win32":
-                self.log("⏳ Opening player...")
-                time.sleep(2.0) # Wait longer for slower disks
-                self.open_file_or_folder(output_file)
+            if auto_play:
+                self.log("▶ Playing generated audio in the built-in player...")
+                self.play_audio_signal.emit(os.path.abspath(output_file), -1)
         except Exception as e:
             self.log(f"❌ SRT Error: {str(e)}")
+            try:
+                for segment in segments:
+                    row = segment.get("_row")
+                    if row is not None:
+                        self.audio_status_signal.emit(int(row), "Failed", "failed")
+            except Exception:
+                pass
         finally: # type: ignore
             # type: ignore
             # Fix Bug #11: Only emit signal when not called from auto-export
             if emit_signal:
                 self.srt_finished_signal.emit()
+            shutil.rmtree(work_dir, ignore_errors=True)
             self.clear_cache() # Clean after finishing
 
     def parse_srt(self, filepath: str) -> list[dict[str, Any]]:
@@ -7107,6 +10787,16 @@ except Exception:
         def is_time_line(line: str) -> bool:
             arrow = get_arrow(line)
             return bool(arrow and any(c.isdigit() for c in line) and ":" in line)
+
+        def parse_time_token(value: str) -> int:
+            token = value.strip().split()[0]
+            match = re.match(r'^(?:(\d{1,2}):)?(\d{2}):(\d{2})[,.](\d{1,3})$', token)
+            if not match:
+                raise ValueError(f"Invalid subtitle timestamp: {value}")
+            _hours, minutes, seconds, _millis = match.groups()
+            if int(minutes) > 59 or int(seconds) > 59:
+                raise ValueError(f"Subtitle timestamp out of range: {value}")
+            return self.time_to_ms(token)
 
         i = 0
         while i < len(lines):
@@ -7134,9 +10824,9 @@ except Exception:
                     if i > 0 and lines[i - 1].strip().isdigit():
                         subtitle_number = int(lines[i - 1].strip())
                     # Split and clean whitespace (Fix for loose formatting)
-                    parts = line.split(arrow)
-                    start_ms = self.time_to_ms(parts[0].strip())
-                    end_ms = self.time_to_ms(parts[1].strip())
+                    parts = line.split(arrow, 1)
+                    start_ms = parse_time_token(parts[0])
+                    end_ms = parse_time_token(parts[1])
                 except:
                     i += 1
                     continue
@@ -7260,12 +10950,12 @@ except Exception:
             except:
                 pass
 
-    def run_tts_thread(self, text: str, voice: str, rate: str, pitch: str, fade_in: int, fade_out: int, ffmpeg_bin: str, output_file: str, auto_play: bool) -> None: # type: ignore
+    def run_tts_thread(self, text: str, voice: str, rate: str, pitch: str, fade_in: int, fade_out: int, ffmpeg_bin: str, output_file: str, auto_play: bool, role: str = "") -> None: # type: ignore
             # Use temp file for download (Edge TTS is MP3)
-            temp_file = "temp_tts.mp3"
+            temp_file = os.path.join(tempfile.gettempdir(), f"srt_drama_tts_{time.time_ns()}_{threading.get_ident()}.mp3")
             try:
                 # Run the async function safely in thread
-                self.run_async_in_thread(self.edge_tts_save(text, voice, temp_file, rate, pitch))
+                self.run_async_in_thread(self.tts_save(text, voice, temp_file, rate, pitch, role))
         
                 # Configure ffmpeg for pydub
                 self._configure_audio_converter(ffmpeg_bin)
@@ -7295,17 +10985,19 @@ except Exception:
                 self.log(f"✅ Success! Saved to: {output_file}")
                 self.tts_finished_signal.emit()
 
-                # Play the audio automatically (Windows only)
-                if auto_play and sys.platform == "win32":
-                    self.log("⏳ Opening player...")
-                    time.sleep(2.0) # Wait longer for slower disks # type: ignore
-                    self.open_file_or_folder(output_file)
+                if auto_play:
+                    self.log("▶ Playing generated audio in the built-in player...")
+                    self.play_audio_signal.emit(os.path.abspath(output_file), -1)
         
             except Exception as e: # type: ignore
                 self.log(f"❌ Error: {str(e)}")
                 self.tts_finished_signal.emit()
             finally:
-                pass # Handled by signal
+                try:
+                    if os.path.exists(temp_file):
+                        os.remove(temp_file)
+                except OSError:
+                    pass
 
     def process_audio_fades(self, filepath: str, fade_in: int, fade_out: int, ffmpeg_bin: str) -> None:
         try: # type: ignore
@@ -7357,6 +11049,221 @@ except Exception:
                     await asyncio.sleep(wait_time)
                     continue
                 raise e
+
+    async def tts_save(self, text: str, voice: str, filename: str, rate: str, pitch: str, role: str = "") -> None:
+        """Generate audio with VoxCPM2 when enabled, otherwise use Edge TTS."""
+        if self.app_settings.get("voxcpm2_enabled", False):
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, self.voxcpm2_save, text, filename, role)
+            return
+        await self.edge_tts_save(text, voice, filename, rate, pitch)
+
+    def _voxcpm2_json_request(self, url: str, payload: Optional[dict[str, Any]] = None, timeout: float = 30.0) -> Any:
+        data = json.dumps(payload).encode("utf-8") if payload is not None else None
+        headers = {"Content-Type": "application/json"} if data is not None else {}
+        request = urllib.request.Request(url, data=data, headers=headers, method="POST" if data is not None else "GET")
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    def _download_voxcpm2_audio(self, result: Any, filename: str) -> None:
+        value = result[0] if isinstance(result, list) and result else result
+        if isinstance(value, dict):
+            remote_url = value.get("url")
+            remote_path = value.get("path")
+        else:
+            remote_url = None
+            remote_path = value
+
+        if remote_path and os.path.exists(str(remote_path)):
+            shutil.copyfile(str(remote_path), filename)
+            return
+
+        if remote_url:
+            download_url = urllib.parse.urljoin(self._get_voxcpm2_url() + "/", str(remote_url))
+        elif remote_path:
+            encoded_path = urllib.parse.quote(str(remote_path), safe="/:\\")
+            download_url = f"{self._get_voxcpm2_url()}/gradio_api/file={encoded_path}"
+        else:
+            raise RuntimeError(f"VoxCPM2 returned no audio file: {result!r}")
+
+        try:
+            with urllib.request.urlopen(download_url, timeout=120) as response, open(filename, "wb") as output:
+                shutil.copyfileobj(response, output)
+        except urllib.error.HTTPError as e:
+            if e.code != 404 or "/gradio_api/file=" not in download_url:
+                raise
+            legacy_url = download_url.replace("/gradio_api/file=", "/file=", 1)
+            with urllib.request.urlopen(legacy_url, timeout=120) as response, open(filename, "wb") as output:
+                shutil.copyfileobj(response, output)
+
+    def _upload_voxcpm2_file(self, path: str) -> str:
+        boundary = f"----SRTDramaTool{int(time.time() * 1000)}"
+        filename = os.path.basename(path)
+        with open(path, "rb") as source:
+            file_data = source.read()
+        body = (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="files"; filename="{filename}"\r\n'
+            "Content-Type: application/octet-stream\r\n\r\n"
+        ).encode("utf-8") + file_data + f"\r\n--{boundary}--\r\n".encode("utf-8")
+        uploaded = None
+        last_error: Optional[Exception] = None
+        for upload_path in ("/gradio_api/upload", "/upload"):
+            try:
+                request = urllib.request.Request(
+                    self._get_voxcpm2_url() + upload_path,
+                    data=body,
+                    headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(request, timeout=120) as response:
+                    uploaded = json.loads(response.read().decode("utf-8"))
+                break
+            except urllib.error.HTTPError as e:
+                last_error = e
+                if e.code != 404:
+                    raise
+        if not isinstance(uploaded, list) or not uploaded:
+            raise RuntimeError(f"VoxCPM2 file upload failed: {last_error or uploaded!r}")
+        return str(uploaded[0])
+
+    def voxcpm2_save(self, text: str, filename: str, role: str = "") -> None:
+        """Generate one audio file through the VoxCPM2 Gradio named endpoint."""
+        base_url = self._get_voxcpm2_url()
+        reference_audio = str(self.app_settings.get("voxcpm2_reference_audio", "")).strip()
+        reference_value: Optional[dict[str, str]] = None
+        if reference_audio:
+            if not os.path.exists(reference_audio):
+                raise RuntimeError(f"VoxCPM2 reference audio was not found: {reference_audio}")
+            reference_stamp = (reference_audio, os.path.getmtime(reference_audio), os.path.getsize(reference_audio))
+            if getattr(self, "_voxcpm2_uploaded_reference_stamp", None) != reference_stamp:
+                self._voxcpm2_uploaded_reference_path = self._upload_voxcpm2_file(reference_audio)
+                self._voxcpm2_uploaded_reference_stamp = reference_stamp
+            reference_value = {
+                "path": self._voxcpm2_uploaded_reference_path,
+                "meta": {"_type": "gradio.FileData"},
+            }
+
+        if self._voxcpm2_has_endpoint("generate_srt_voice"):
+            self._voxcpm2_custom_srt_save(text, filename, reference_value, role)
+            return
+
+        payload = {
+            "data": [
+                text,
+                str(self.app_settings.get("voxcpm2_control_instruction", "")).strip(),
+                reference_value,
+                False,
+                "",
+                float(self.app_settings.get("voxcpm2_cfg_value", 2.0)),
+                bool(self.app_settings.get("voxcpm2_normalize", False)),
+                bool(self.app_settings.get("voxcpm2_denoise", False)),
+                int(self.app_settings.get("voxcpm2_inference_steps", 10)),
+            ]
+        }
+        last_error: Optional[Exception] = None
+        for api_prefix in ("/gradio_api/call/generate", "/call/generate"):
+            try:
+                start = self._voxcpm2_json_request(base_url + api_prefix, payload, timeout=30.0)
+                event_id = start.get("event_id") if isinstance(start, dict) else None
+                if not event_id:
+                    raise RuntimeError(f"VoxCPM2 returned no event ID: {start!r}")
+
+                request = urllib.request.Request(f"{base_url}{api_prefix}/{event_id}", method="GET")
+                with urllib.request.urlopen(request, timeout=600) as response:
+                    event_stream = response.read().decode("utf-8", errors="replace")
+
+                final_result: Any = None
+                for line in event_stream.splitlines():
+                    if line.startswith("data:"):
+                        data_text = line[5:].strip()
+                        try:
+                            final_result = json.loads(data_text)
+                        except json.JSONDecodeError:
+                            continue
+                if final_result is None:
+                    raise RuntimeError(f"VoxCPM2 returned no generated audio: {event_stream[-500:]}")
+                self._download_voxcpm2_audio(final_result, filename)
+                return
+            except urllib.error.HTTPError as e:
+                last_error = e
+                if e.code != 404:
+                    break
+            except Exception as e:
+                last_error = e
+                break
+        raise RuntimeError(f"VoxCPM2 generation failed: {last_error}")
+
+    def _voxcpm2_has_endpoint(self, endpoint_name: str) -> bool:
+        """Return whether the connected Gradio app exposes a named endpoint."""
+        try:
+            info = self._voxcpm2_json_request(f"{self._get_voxcpm2_url()}/gradio_api/info", timeout=5.0)
+            endpoints = info.get("named_endpoints", {}) if isinstance(info, dict) else {}
+            return f"/{endpoint_name}" in endpoints
+        except Exception:
+            return False
+
+    def _get_voxcpm2_default_speaker(self) -> str:
+        """Return a valid speaker dropdown value from the custom VoxCPM2 server."""
+        try:
+            choices = self._get_voxcpm2_speaker_choices()
+            configured = str(self.app_settings.get("voxcpm2_default_speaker", "")).strip()
+            if hasattr(self, "voxcpm2_speaker_combo"):
+                configured = self.voxcpm2_speaker_combo.currentText().strip() or configured
+            if configured in choices:
+                return configured
+            if choices:
+                return str(choices[0])
+        except Exception:
+            pass
+        return "Default"
+
+    def _voxcpm2_custom_srt_save(self, text: str, filename: str, reference_value: Any, role: str = "") -> None:
+        """Generate audio through the local custom VoxCPM2 SRT endpoint."""
+        base_url = self._get_voxcpm2_url()
+        clean_text = text.strip()
+        use_all_characters = self.app_settings.get("voxcpm2_voice_mode", "all") == "all"
+        role_prefix = f"[{role.strip()}] " if use_all_characters and role and role.strip() else ""
+        estimated_ms = max(3000, min(30000, len(clean_text) * 125))
+        end_seconds, end_ms = divmod(estimated_ms, 1000)
+        end_minutes, end_seconds = divmod(end_seconds, 60)
+        srt_text = text if re.search(r"\d{2}:\d{2}:\d{2}[,.]\d{3}\s*-->", text) else (
+            f"1\n00:00:00,000 --> 00:{end_minutes:02d}:{end_seconds:02d},{end_ms:03d}\n{role_prefix}{clean_text}\n"
+        )
+        payload = {
+            "srt_text": srt_text,
+            "default_speaker": self._get_voxcpm2_default_speaker(),
+            "speed": 1.0,
+            "pitch": 1.0,
+            "custom_ref": reference_value,
+        }
+        start = self._voxcpm2_json_request(
+            f"{base_url}/gradio_api/call/v2/generate_srt_voice",
+            payload,
+            timeout=30.0,
+        )
+        event_id = start.get("event_id") if isinstance(start, dict) else None
+        if not event_id:
+            raise RuntimeError(f"VoxCPM2 returned no event ID: {start!r}")
+
+        request = urllib.request.Request(
+            f"{base_url}/gradio_api/call/generate_srt_voice/{event_id}",
+            method="GET",
+        )
+        with urllib.request.urlopen(request, timeout=600) as response:
+            event_stream = response.read().decode("utf-8", errors="replace")
+
+        final_result: Any = None
+        for line in event_stream.splitlines():
+            if line.startswith("data:"):
+                try:
+                    final_result = json.loads(line[5:].strip())
+                except json.JSONDecodeError:
+                    continue
+        if final_result is None:
+            raise RuntimeError(f"VoxCPM2 returned no generated audio: {event_stream[-500:]}")
+        self._download_voxcpm2_audio(final_result, filename)
+
     def export_wav(self) -> None: # type: ignore
         segments = self.get_active_segments()
         if not segments:
@@ -7377,8 +11284,11 @@ except Exception:
         if not output_file:
             return
 
+        self.stop_event.clear()
         self.log(f"Exporting Full TTS to {output_file}...")
         self.btn_export_wav.setEnabled(False)
+        self.btn_timeline_audio.setEnabled(False)
+        self.btn_run_srt.setEnabled(False)
 
         ffmpeg_bin = self.get_ffmpeg()
         auto_fit = self.chk_auto_fit.isChecked()
@@ -7388,39 +11298,122 @@ except Exception:
 
         self.start_worker_thread(target=self.run_srt_thread, args=(segments, ffmpeg_bin, output_file, quality_idx, auto_fit, fade_in, fade_out))
 
+    def _generated_clip_path_for_segment(self, segment: dict[str, Any]) -> str:
+        row = segment.get("_row")
+        if row is None:
+            return ""
+        audio_info = getattr(self, "generated_audio_segments", {}).get(int(row), {})
+        path = str(audio_info.get("path", "") or "")
+        return path if path and os.path.exists(path) else ""
+
+    def _segments_have_generated_clips(self, segments: list[dict[str, Any]]) -> bool:
+        return bool(segments) and all(self._generated_clip_path_for_segment(segment) for segment in segments)
+
+    def _assemble_generated_clips_audio(self, segments: list[dict[str, Any]], output_file: str, ffmpeg_bin: str) -> bool:
+        """Build one render-ready WAV from already generated row clips."""
+        try:
+            self._configure_audio_converter(ffmpeg_bin)
+            max_end = max(int(segment.get("end", 0) or 0) for segment in segments)
+            target_rate = 44100
+            first_clip = self._generated_clip_path_for_segment(segments[0])
+            if first_clip:
+                try:
+                    target_rate = self.safe_load_audio(first_clip, ffmpeg_bin).frame_rate
+                except Exception:
+                    pass
+            final_audio = AudioSegment.silent(duration=max_end + 3000, frame_rate=target_rate)
+            for index, segment in enumerate(sorted(segments, key=lambda item: int(item.get("start", 0) or 0)), start=1):
+                if self.stop_event.is_set():
+                    self.log("🛑 Render audio assembly stopped by user.")
+                    return False
+                clip_path = self._generated_clip_path_for_segment(segment)
+                if not clip_path:
+                    return False
+                row = segment.get("_row")
+                if row is not None:
+                    self.audio_status_signal.emit(int(row), "Render", "generating")
+                clip = self.safe_load_audio(clip_path, ffmpeg_bin)
+                start_ms = max(0, int(segment.get("start", 0) or 0) - 50)
+                final_audio = final_audio.overlay(clip, position=start_ms)
+                self.progress_signal.emit(min(45, int(index / max(1, len(segments)) * 45)))
+            final_audio.export(output_file, format="wav")
+            for segment in segments:
+                row = segment.get("_row")
+                if row is not None:
+                    self.audio_status_signal.emit(int(row), "Done", "done")
+            return True
+        except Exception as e:
+            self.safe_log(f"⚠️ Could not assemble generated audio clips for render: {e}")
+            return False
+
     def run_auto_export_thread(self, video_path: str, output_video_file: str, segments: list[dict[str, Any]], ffmpeg_bin: str, video_settings: dict[str, Any], audio_settings: dict[str, Any]) -> None:
         # Temp audio path
-        temp_audio = os.path.join(self.get_output_dir(), "temp_auto_export.wav")
+        temp_audio = os.path.join(tempfile.gettempdir(), f"srt_drama_auto_export_{time.time_ns()}.wav")
 
-        self.log("🔄 Step 1/2: Auto-generating Audio (SRT to WAV)...")
+        if self._segments_have_generated_clips(segments):
+            self.log("🔄 Step 1/2: Using generated audio clips for render...")
+            self.progress_text_signal.emit("Render 1/2: assembling generated audio")
+            assembled = self._assemble_generated_clips_audio(segments, temp_audio, ffmpeg_bin)
+            if not assembled:
+                self.log("⚠️ Generated clips could not be assembled. Auto-generating render audio instead.")
 
-        # Fix Bug #11: Disable signal emission during auto-export to prevent premature UI re-enable
-        self.run_srt_thread(segments, ffmpeg_bin, temp_audio, quality_idx=0,
-                            auto_fit=audio_settings['auto_fit'],
-                            fade_in=audio_settings['fade_in'],
-                            fade_out=audio_settings['fade_out'],
-                            auto_play=False, # type: ignore
-                            emit_signal=False) # type: ignore
+        if not os.path.exists(temp_audio):
+            self.log("🔄 Step 1/2: Auto-generating Audio (SRT to WAV)...")
+            self.progress_text_signal.emit("Render 1/2: generating audio")
+            # Fix Bug #11: Disable signal emission during auto-export to prevent premature UI re-enable
+            self.run_srt_thread(segments, ffmpeg_bin, temp_audio, quality_idx=0,
+                                auto_fit=audio_settings['auto_fit'],
+                                fade_in=audio_settings['fade_in'],
+                                fade_out=audio_settings['fade_out'],
+                                auto_play=False, # type: ignore
+                                emit_signal=False) # type: ignore
                     
         if not os.path.exists(temp_audio):
             self.log("❌ Auto-generation failed. Stopping export.")
+            self.srt_finished_signal.emit()
             self.export_finished_signal.emit()
             return
     
         self.log(f"✅ Audio Ready: {os.path.basename(temp_audio)}")
         self.log("🔄 Step 2/2: Rendering Video...")
+        self.progress_text_signal.emit("Render 2/2: encoding video")
 
-        self.run_export_mp4_thread(video_path, temp_audio, output_video_file, ffmpeg_bin, video_settings)
-
-        try: os.remove(temp_audio)
-        except: pass
-
-        # Fix Bug #11: Emit signals only after entire auto-export completes
-        self.srt_finished_signal.emit()
-        self.export_finished_signal.emit()
+        try:
+            self.run_export_mp4_thread(video_path, temp_audio, output_video_file, ffmpeg_bin, video_settings)
+        except Exception as e:
+            self.safe_log(f"❌ Auto-export render failed: {e}")
+            self.export_finished_signal.emit()
+        finally:
+            try:
+                os.remove(temp_audio)
+            except OSError:
+                pass
+            # run_export_mp4_thread emits export_finished_signal when rendering ends.
+            self.srt_finished_signal.emit()
 
     def preview_video_effects(self) -> None:
         self.export_mp4(preview=True)
+
+    def _paths_same_file(self, first_path: str, second_path: str) -> bool:
+        try:
+            return os.path.samefile(first_path, second_path)
+        except Exception:
+            return os.path.normcase(os.path.abspath(first_path)) == os.path.normcase(os.path.abspath(second_path))
+
+    def _non_conflicting_output_path(self, output_file: str, input_file: str) -> str:
+        """Avoid FFmpeg in-place editing by moving output to a sibling *_dubbed file."""
+        if not output_file or not input_file or not self._paths_same_file(output_file, input_file):
+            return output_file
+        root, ext = os.path.splitext(output_file)
+        ext = ext or ".mp4"
+        candidate = f"{root}_dubbed{ext}"
+        index = 2
+        while os.path.exists(candidate) and self._paths_same_file(candidate, input_file):
+            candidate = f"{root}_dubbed_{index}{ext}"
+            index += 1
+        self.log(f"⚠️ Output file was the same as input video. Using: {os.path.basename(candidate)}")
+        return candidate
+
     def apply_lip_sync(self, video_path: str, audio_path: str, output_path: str, character_info: Optional[dict[str, str]] = None) -> bool:
         """
         Apply lip-sync to video using SRT-detected character information.
@@ -7490,6 +11483,7 @@ except Exception:
     
             if not output_file:
                 return
+        output_file = self._non_conflicting_output_path(output_file, video_path)
 
         ffmpeg_bin = self.get_ffmpeg()
 
@@ -7535,6 +11529,21 @@ except Exception:
                 self.btn_export_mp4.setEnabled(True)
                 return
 
+            self.btn_run_srt.setEnabled(False)
+            self.btn_timeline_audio.setEnabled(False)
+            self.btn_export_wav.setEnabled(False)
+            if hasattr(self, "btn_stop_gemini_transcribe"):
+                self.btn_stop_gemini_transcribe.setText("Stop Render")
+                self.btn_stop_gemini_transcribe.setToolTip("Stop the current render job")
+                self.btn_stop_gemini_transcribe.setVisible(True)
+                self.btn_stop_gemini_transcribe.setEnabled(True)
+                try:
+                    self.btn_stop_gemini_transcribe.clicked.disconnect()
+                except TypeError:
+                    pass
+                self.btn_stop_gemini_transcribe.clicked.connect(self.stop_processing)
+            self.stop_event.clear()
+
             # Save the output directory for future use
             output_dir = os.path.dirname(output_file)
             if output_dir:
@@ -7551,6 +11560,7 @@ except Exception:
 
     def run_export_mp4_thread(self, video_path: str, tts_audio: str, output_file: str, ffmpeg_bin: str, s: dict[str, Any]) -> None: # type: ignore
         try: # type: ignore
+            output_file = self._non_conflicting_output_path(output_file, video_path)
             # Build Filter Complex
             # 1. Crop
             top, btm, left, right = s['crop'] # type: ignore
@@ -7686,6 +11696,13 @@ except Exception:
         
                 # Read stderr line by line for real-time progress
                 while True:
+                    if self.stop_event.is_set():
+                        try:
+                            process.terminate()
+                        except Exception:
+                            pass
+                        self.log("🛑 Render stopped by user.")
+                        return
                     line = process.stderr.readline()  # type: ignore[union-attr]
                     if not line:
                         break
@@ -7748,10 +11765,8 @@ except Exception:
     
             # Check Auto Play setting
             if s.get('auto_play', True):
-                if sys.platform == "win32":
-                    self.log("⏳ Opening player...")
-                    time.sleep(3.0) # Wait 3s to ensure file is fully written
-                    self.open_file_or_folder(output_file)
+                self.log("▶ Loading exported video in the built-in player...")
+                self.play_video_signal.emit(os.path.abspath(output_file))
             else:
                 self.log("ℹ️ Auto-play disabled. Please open the folder to view.")
 
@@ -7777,6 +11792,9 @@ except Exception:
                     start = self.ms_to_time(seg['start'])
                     end = self.ms_to_time(seg['end'])
                     text = seg['text']
+                    role = str(seg.get('role', '')).strip()
+                    if self.chk_include_character_tags.isChecked() and role and role != "Unknown":
+                        text = f"[{role}] {text}"
 
                     f.write(f"{i+1}\n")
                     f.write(f"{start} --> {end}\n")
@@ -7873,13 +11891,14 @@ except Exception:
 
         # Preserve existing rate/pitch if any
         existing = self.role_configs.get(role, {})
-        rate = existing.get("rate", 0)
-        tts_pitch = existing.get("tts_pitch", 0)
+        rate = coerce_int(existing.get("rate"), 0)
+        tts_pitch = coerce_int(existing.get("tts_pitch"), 0)
         fade_in = self.fade_in.value()
         fade_out = self.fade_out.value()
+        edge_voice = self.edge_voice_combo.currentData()
 
         config = {
-            "voice": self.get_voice_from_role(role),
+            "voice": edge_voice or self.get_voice_from_role(role),
             "age": self.age_combo.currentText(),
             "emotion": self.emotion_combo.currentText(),
             "rate": rate,
@@ -7905,6 +11924,12 @@ except Exception:
             self.app_settings = {}
 
         self.app_settings.setdefault("update_url", DEFAULT_UPDATE_URL)
+        self.app_settings.setdefault("voxcpm2_enabled", False)
+        self.app_settings.setdefault("voxcpm2_autostart", False)
+        self.app_settings.setdefault("voxcpm2_stop_on_close", True)
+        self.app_settings.setdefault("voxcpm2_voice_mode", "all")
+        self.app_settings.setdefault("tts_character_scope", "all_tags")
+        self.app_settings.setdefault("voxcpm2_url", DEFAULT_VOXCPM2_URL)
 
         try:
             with open(self.get_config_path("app_settings.json"), "w", encoding="utf-8") as f:
@@ -7979,10 +12004,14 @@ except Exception:
                 combo.setCurrentText(current)
                 combo.blockSignals(False) # type: ignore
                 self.apply_role_combo_highlight(combo, current)
+        self._refresh_tts_scope_roles()
     def closeEvent(self, a0: Optional[QCloseEvent]) -> None: # type: ignore
         # Set stop_event to signal all running threads to stop (Fix: race condition)
         if hasattr(self, 'stop_event'):
             self.stop_event.set()
+
+        if self.app_settings.get("voxcpm2_stop_on_close", True):
+            self._stop_voxcpm2_server(silent=True)
 
         # Stop players to release file handles
         if hasattr(self, 'media_player'): # type: ignore
@@ -8072,15 +12101,18 @@ except Exception:
         self.emotion_combo.blockSignals(True)
         self.fade_in.blockSignals(True)
         self.fade_out.blockSignals(True) # type: ignore
+        self.edge_voice_combo.blockSignals(True)
 
         if role in self.role_configs: # type: ignore
             c = self.role_configs[role]
-            self.age_combo.setCurrentText(c.get("age", ""))
-            self.emotion_combo.setCurrentText(c.get("emotion", ""))
+            self.age_combo.setCurrentText(str(c.get("age", "") or ""))
+            self.emotion_combo.setCurrentText(str(c.get("emotion", "") or ""))
+            edge_voice_index = self.edge_voice_combo.findData(c.get("voice", "km-KH-PisethNeural"))
+            self.edge_voice_combo.setCurrentIndex(max(0, edge_voice_index))
     
             # Load Fade settings if available (Load ការកំណត់ Fade របស់តួអង្គ)
-            self.fade_in.setValue(c.get("fade_in", 50)) # type: ignore
-            self.fade_out.setValue(c.get("fade_out", 50))
+            self.fade_in.setValue(coerce_int(c.get("fade_in"), 50)) # type: ignore
+            self.fade_out.setValue(coerce_int(c.get("fade_out"), 50))
     
             self.log(f"Loaded config for {role}") # type: ignore
         else:
@@ -8089,11 +12121,13 @@ except Exception:
             self.emotion_combo.setCurrentIndex(0)
             self.fade_in.setValue(50)
             self.fade_out.setValue(50)
+            self.edge_voice_combo.setCurrentIndex(1)
     
         self.age_combo.blockSignals(False) # type: ignore
         self.emotion_combo.blockSignals(False) # type: ignore
         self.fade_in.blockSignals(False)
         self.fade_out.blockSignals(False) # type: ignore
+        self.edge_voice_combo.blockSignals(False)
     def create_menu_bar(self) -> None:
         menubar = self.menuBar()
         if menubar:
@@ -8142,16 +12176,16 @@ except Exception:
     def open_project(self, path: Optional[str] = None) -> None:
         if not path: # type: ignore
             last_dir = self.app_settings.get("last_project_dir", "")
-            path, _ = QFileDialog.getOpenFileName(self, "Open Project", last_dir, "RVC Project (*.json)")
+            path, _ = QFileDialog.getOpenFileName(self, "Open Project", last_dir, "SRT Drama Project (*.json)")
 
         if path:
-            self.current_project_path = path
-            self.app_settings["last_project_dir"] = os.path.dirname(path)
-            self.save_app_settings()
             try: # type: ignore
                 with open(path, "r", encoding="utf-8") as f:
                     data = json.load(f) # type: ignore
                 self.load_project_data(data)
+                self.current_project_path = path
+                self.app_settings["last_project_dir"] = os.path.dirname(path)
+                self.save_app_settings()
             except Exception as e:
                 QMessageBox.warning(self, "Error", f"Could not open project:\n{e}")
 
@@ -8163,7 +12197,7 @@ except Exception:
 
     def save_project_as(self) -> None:
         last_dir = self.app_settings.get("last_project_dir", "") # type: ignore
-        path, _ = QFileDialog.getSaveFileName(self, "Save Project", last_dir, "RVC Project (*.json)")
+        path, _ = QFileDialog.getSaveFileName(self, "Save Project", last_dir, "SRT Drama Project (*.json)")
         if path:
             self.current_project_path = path
             self.app_settings["last_project_dir"] = os.path.dirname(path)
@@ -8236,7 +12270,7 @@ except Exception:
             return
 
         last_dir = self.app_settings.get("last_project_dir", "")
-        paths, _ = QFileDialog.getOpenFileNames(self, "Select Projects to Merge", last_dir, "RVC Project (*.json)")
+        paths, _ = QFileDialog.getOpenFileNames(self, "Select Projects to Merge", last_dir, "SRT Drama Project (*.json)")
 
         if not paths:
             return
@@ -8251,6 +12285,7 @@ except Exception:
             try:
                 with open(project_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
+                data = self._normalize_project_data(data)
                 video_path = data.get("video_path", "")
                 if not video_path or not os.path.exists(video_path):
                     QMessageBox.warning(self, "Merge Projects", f"Project {os.path.basename(project_path)} has no valid video file.")
@@ -8261,20 +12296,27 @@ except Exception:
                 return
 
         self.merge_in_progress = True
+        self.stop_event.clear()
+        self.btn_run_srt.setEnabled(False)
+        self.btn_timeline_audio.setEnabled(False)
+        self.btn_export_wav.setEnabled(False)
+        self.btn_export_mp4.setEnabled(False)
+        self._set_main_stop_button(True, "Stop Merge")
         self.progress.setValue(0)
         self.progress_text_signal.emit("Merging projects...")
         self.log(f"🔗 Starting merge for {len(project_data)} projects...")
         self.start_worker_thread(
             target=self.merge_projects_worker,
-            args=(project_data, self.chk_gpu.isChecked(), self.get_ffmpeg())
+            args=(project_data, self.chk_gpu.isChecked(), self.get_ffmpeg(), self.get_output_dir())
         )
 
     def build_project_tts_segments(self, data: dict[str, Any]) -> list[dict[str, Any]]:
         """Convert saved project segments into the richer shape expected by run_srt_thread."""
-        project_role_configs = data.get("role_configs", get_default_role_configs())
+        data = self._normalize_project_data(data)
+        project_role_configs = data.get("role_configs") or get_default_role_configs()
         project_settings = data.get("settings", {})
-        global_fade_in = project_settings.get("fade_in", 50)
-        global_fade_out = project_settings.get("fade_out", 50)
+        global_fade_in = coerce_int(project_settings.get("fade_in"), 50)
+        global_fade_out = coerce_int(project_settings.get("fade_out"), 50)
 
         def role_tts_params(role: str) -> tuple[str, str, str]:
             config = project_role_configs.get(role, {})
@@ -8282,18 +12324,18 @@ except Exception:
             if not voice:
                 voice = "km-KH-SreymomNeural" if ("Female" in role or "Girl" in role or "ស្រី" in role) else "km-KH-PisethNeural"
 
-            rate_val = int(config.get("rate", 0))
-            pitch_val = int(config.get("tts_pitch", 0))
+            rate_val = coerce_int(config.get("rate"), 0)
+            pitch_val = coerce_int(config.get("tts_pitch"), 0)
             age = str(config.get("age", ""))
             emotion = str(config.get("emotion", ""))
 
-            if "Child" in age:
+            if "Child" in age or "កុមារ" in age or "ក្មេង" in age:
                 pitch_val += 25
                 rate_val += 10
-            elif "Teen" in age:
+            elif "Teen" in age or "យុវ" in age:
                 pitch_val += 10
                 rate_val += 5
-            elif "Elder" in age:
+            elif "Elder" in age or "ចាស់" in age or "ជរា" in age:
                 pitch_val -= 15
                 rate_val -= 10
 
@@ -8314,11 +12356,13 @@ except Exception:
 
         tts_segments = []
         for seg in data.get("segments", []):
+            if not str(seg.get("text", "")).strip() or int(seg.get("end", 0)) <= int(seg.get("start", 0)):
+                continue
             role = seg.get("role", "")
             voice, rate_str, pitch_str = role_tts_params(role)
             config = project_role_configs.get(role, {})
-            role_fade_in = config.get("fade_in", -1)
-            role_fade_out = config.get("fade_out", -1)
+            role_fade_in = coerce_int(config.get("fade_in"), -1)
+            role_fade_out = coerce_int(config.get("fade_out"), -1)
             tts_segments.append({
                 "text": seg.get("text", ""),
                 "voice": voice,
@@ -8331,7 +12375,7 @@ except Exception:
             })
         return tts_segments
 
-    def merge_projects_worker(self, project_data: list[tuple[dict[str, Any], str]], use_gpu: bool, ffmpeg_bin: str) -> None:
+    def merge_projects_worker(self, project_data: list[tuple[dict[str, Any], str]], use_gpu: bool, ffmpeg_bin: str, merged_output_dir: Optional[str] = None) -> None:
         """Export each project and concatenate the temporary videos in a background thread."""
         temp_videos = []
         temp_audios = []
@@ -8341,6 +12385,14 @@ except Exception:
             total_projects = max(1, len(project_data))
 
             for i, (data, video_path) in enumerate(project_data):
+                if self.stop_event.is_set():
+                    self.safe_log("🛑 Merge stopped by user.")
+                    self.merge_finished_signal.emit({
+                        "success": False,
+                        "message": "Merge stopped by user.",
+                        "cleanup": temp_videos + temp_audios,
+                    })
+                    return
                 self.safe_log(f"🔊 Merge {i + 1}/{total_projects}: generating audio...")
                 self.progress_text_signal.emit(f"Merge {i + 1}/{total_projects}: audio")
                 self.progress_signal.emit(int(i / total_projects * 80))
@@ -8350,7 +12402,7 @@ except Exception:
                     self.safe_log(f"⚠️ Project {i + 1} has no segments. Skipping.")
                     continue
 
-                timestamp = int(time.time() * 1000)
+                timestamp = time.time_ns()
                 temp_audio = os.path.join(tempfile.gettempdir(), f"merge_audio_{i}_{timestamp}.wav")
                 temp_audios.append(temp_audio)
                 try:
@@ -8414,10 +12466,20 @@ except Exception:
                 return
 
             self.safe_log("🔗 Concatenating exported project videos...")
+            if self.stop_event.is_set():
+                self.safe_log("🛑 Merge stopped before video concatenation.")
+                self.merge_finished_signal.emit({
+                    "success": False,
+                    "message": "Merge stopped by user.",
+                    "cleanup": temp_videos + temp_audios,
+                })
+                return
             self.progress_text_signal.emit("Concatenating merged video...")
             self.progress_signal.emit(90)
 
-            merged_video_path = os.path.join(tempfile.gettempdir(), f"merged_projects_{int(time.time())}.mp4")
+            output_dir = merged_output_dir or self.get_output_dir()
+            os.makedirs(output_dir, exist_ok=True)
+            merged_video_path = os.path.join(output_dir, f"Merged_Projects_{time.time_ns()}.mp4")
             success, error_msg = self.concat_project_videos(temp_videos, merged_video_path)
             if not success or not os.path.exists(merged_video_path):
                 self.merge_finished_signal.emit({
@@ -8469,6 +12531,11 @@ except Exception:
 
     def on_merge_projects_finished(self, result: dict[str, Any]) -> None:
         self.merge_in_progress = False
+        self.btn_run_srt.setEnabled(True)
+        self.btn_timeline_audio.setEnabled(True)
+        self.btn_export_wav.setEnabled(True)
+        self.btn_export_mp4.setEnabled(True)
+        self._set_main_stop_button(False)
         self.progress_signal.emit(100 if result.get("success") else 0)
         self.progress_text_signal.emit("")
 
@@ -8507,6 +12574,7 @@ except Exception:
 
         for i, seg in enumerate(merged_segments):
             self.set_table_row(i, seg["start"], seg["end"], seg["role"], seg["text"])
+        self._refresh_timeline()
 
         QMessageBox.information(
             self,
@@ -8562,6 +12630,9 @@ except Exception:
                 self.lbl_duration.setText("00:00 / 00:00")
                 self.position_slider.setRange(0, 0)
                 self.position_slider.setValue(0)
+                if hasattr(self, "sidebar_project_label"):
+                    self.sidebar_project_label.setText("No video loaded")
+                self._refresh_timeline()
 
                 self.log("📄 New project created") # type: ignore
                 QMessageBox.information(self, "New Project", "New project created successfully!\n(គម្រោងថ្មីត្រូវបានបង្កើត)")
@@ -8589,6 +12660,7 @@ except Exception:
                 self._clear_table_cell_widgets(row)
 
             self.segment_table.setRowCount(0)
+            self._refresh_timeline()
             self.log(f"🗑️ Cleared all {row_count} segments")
     def write_project_file(self, path: str) -> None:
         try:
@@ -8651,7 +12723,54 @@ except Exception:
             })
         data["segments"] = segments
         return data
+    def _normalize_project_data(self, data: Any) -> dict[str, Any]:
+        if not isinstance(data, dict):
+            raise ValueError("Project file must contain a JSON object.")
+
+        normalized = dict(data)
+        settings = data.get("settings", {})
+        normalized["settings"] = settings if isinstance(settings, dict) else {}
+
+        role_configs = data.get("role_configs", {})
+        if isinstance(role_configs, dict):
+            normalized["role_configs"] = {
+                str(role): config for role, config in role_configs.items()
+                if isinstance(config, dict)
+            }
+        else:
+            normalized["role_configs"] = {}
+
+        segments = []
+        raw_segments = data.get("segments", [])
+        if not isinstance(raw_segments, list):
+            raise ValueError("Project segments must be a list.")
+        for index, segment in enumerate(raw_segments, 1):
+            if not isinstance(segment, dict):
+                self.log(f"⚠️ Skipped invalid project segment #{index}.")
+                continue
+            try:
+                start = max(0, int(segment.get("start", 0)))
+                end = max(0, int(segment.get("end", 0)))
+            except (TypeError, ValueError, OverflowError):
+                self.log(f"⚠️ Skipped project segment #{index} with invalid timing.")
+                continue
+            segments.append({
+                "start": start,
+                "end": end,
+                "role": str(segment.get("role", "Unknown") or "Unknown"),
+                "text": str(segment.get("text", "") or ""),
+            })
+        normalized["segments"] = segments
+        return normalized
+
     def load_project_data(self, data: dict[str, Any]) -> None: # type: ignore
+        data = self._normalize_project_data(data)
+        def float_setting(value: Any, default: float) -> float:
+            try:
+                return float(value)
+            except (TypeError, ValueError, OverflowError):
+                return default
+
         # Load Video
         video_path = data.get("video_path", "") # type: ignore
         if video_path and os.path.exists(video_path):
@@ -8659,24 +12778,26 @@ except Exception:
 
         # Load Settings
         settings = data.get("settings", {})
-        self.speed_spin.setValue(settings.get("speed", 0))
-        self.fade_in.setValue(settings.get("fade_in", 50))
-        self.fade_out.setValue(settings.get("fade_out", 50)) # type: ignore
+        self.speed_spin.setValue(coerce_int(settings.get("speed"), 0))
+        self.fade_in.setValue(coerce_int(settings.get("fade_in"), 50))
+        self.fade_out.setValue(coerce_int(settings.get("fade_out"), 50)) # type: ignore
 
         # --- Load Export Configs (ទាញយកការកំណត់ Export) ---
-        self.cb_resolution.setCurrentIndex(settings.get("resolution_idx", 0))
-        self.cb_crop_preset.setCurrentIndex(settings.get("crop_preset_idx", 0))
-        self.sb_brightness.setValue(settings.get("brightness", 0.0))
-        self.sb_contrast.setValue(settings.get("contrast", 1.0))
-        self.sb_saturation.setValue(settings.get("saturation", 1.0))
+        self.cb_resolution.setCurrentIndex(coerce_int(settings.get("resolution_idx"), 0))
+        self.cb_crop_preset.setCurrentIndex(coerce_int(settings.get("crop_preset_idx"), 0))
+        self.sb_brightness.setValue(float_setting(settings.get("brightness"), 0.0))
+        self.sb_contrast.setValue(float_setting(settings.get("contrast"), 1.0))
+        self.sb_saturation.setValue(float_setting(settings.get("saturation"), 1.0))
         crop = settings.get("crop", [0,0,0,0])
-        if self.sb_crop_top is not None: self.sb_crop_top.setValue(crop[0])
-        if self.sb_crop_bottom is not None: self.sb_crop_bottom.setValue(crop[1]) # type: ignore
-        if self.sb_crop_left is not None: self.sb_crop_left.setValue(crop[2])
-        if self.sb_crop_right is not None: self.sb_crop_right.setValue(crop[3]) # type: ignore
+        if not isinstance(crop, (list, tuple)) or len(crop) != 4:
+            crop = [0, 0, 0, 0]
+        if self.sb_crop_top is not None: self.sb_crop_top.setValue(coerce_int(crop[0], 0))
+        if self.sb_crop_bottom is not None: self.sb_crop_bottom.setValue(coerce_int(crop[1], 0)) # type: ignore
+        if self.sb_crop_left is not None: self.sb_crop_left.setValue(coerce_int(crop[2], 0))
+        if self.sb_crop_right is not None: self.sb_crop_right.setValue(coerce_int(crop[3], 0)) # type: ignore
 
         # Load role configurations from project data
-        self.role_configs = data.get("role_configs", get_default_role_configs())
+        self.role_configs = data.get("role_configs") or get_default_role_configs()
         self.roles = list(self.role_configs.keys())
 
         # Load Segments
@@ -8712,6 +12833,7 @@ except Exception:
     
 
         self.btn_run_srt.setEnabled(True)
+        self._refresh_timeline()
         self.log(f"✅ Project loaded with {len(segments)} segments.")
 
 
@@ -8743,116 +12865,25 @@ if __name__ == "__main__":
         # Fix Bug #27: Use proper config path for license file
         license_file = get_config_path('license.key')
         is_registered = False
+        online_config = load_online_license_config()
+        strict_online = online_license_is_strict(online_config)
 
         online_valid, online_msg = validate_saved_online_license(machine_id)
         if online_valid:
             is_registered = True
 
-        if not is_registered and os.path.exists(license_file):
+        if not is_registered and not strict_online and os.path.exists(license_file):
             with open(license_file, "r") as f:
                 saved_key = f.read().strip()
                 valid, _ = verify_license_key(saved_key, machine_id)
                 if valid: is_registered = True
 
         if not is_registered:
-            # Check Trial Period (7 Days) # type: ignore
-            # USE REGISTRY INSTEAD OF JSON FILE (More Secure)
-            reg_path = r"SOFTWARE\SRT_Drama_Tool_v15"
-            current_ts = datetime.datetime.now().timestamp()
-
-            first_run_ts = 0.0
-            last_run_ts = 0.0
-            stored_hash = ""
-
-            # SECURE TRIAL: Cross-validation hash to prevent registry manipulation
-            def get_secure_trial_hash(machine_id, first_run_ts):
-                """Create hash from MachineID + Timestamp + Secret Salt"""
-                raw = f"{machine_id}|{first_run_ts}|DRAMA_TOOL_SALT_2026" # type: ignore
-                return hashlib.sha256(raw.encode()).hexdigest()[:16]
-
-            try:
-                # Try to read from Registry
-                key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, reg_path, 0, winreg.KEY_READ)
-                fr, _ = winreg.QueryValueEx(key, "FirstRun")
-                lr, _ = winreg.QueryValueEx(key, "LastRun")
-                # Read stored hash for validation
-                try:
-                    stored_hash, _ = winreg.QueryValueEx(key, "TrialHash")
-                except:
-                    stored_hash = ""
-                winreg.CloseKey(key)
-                first_run_ts = float(fr) # type: ignore
-                last_run_ts = float(lr)
-            except FileNotFoundError:
-                # Not found = First run ever
-                pass
-            except Exception:
-                pass # type: ignore
-
-            if first_run_ts == 0.0:
-                # Initialize Trial in Registry
-                try:
-                    key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, reg_path)
-                    winreg.SetValueEx(key, "FirstRun", 0, winreg.REG_SZ, str(current_ts))
-                    winreg.SetValueEx(key, "LastRun", 0, winreg.REG_SZ, str(current_ts))
-                    # Store secure hash for cross-validation
-                    trial_hash = get_secure_trial_hash(machine_id, current_ts)
-                    winreg.SetValueEx(key, "TrialHash", 0, winreg.REG_SZ, trial_hash)
-                    winreg.CloseKey(key) # type: ignore
-                except Exception:
-                    pass # If registry fails, might fallback or allow
-                is_registered = True # Allow trial
+            dlg = LicenseDialog(machine_id)
+            if dlg.exec_() == QDialog.Accepted:
+                is_registered = True
             else:
-                # SECURITY CHECK: Validate hash to detect registry manipulation
-                expected_hash = get_secure_trial_hash(machine_id, first_run_ts)
-                if stored_hash and stored_hash != expected_hash:
-                    # Hash mismatch = Registry tampered or FirstRun timestamp modified
-                    QMessageBox.critical(None, "Security Error", 
-                        "Trial validation failed!\n"
-                        "Registry tampering detected. (រកឃើញការកែប្រែ Registry)\n"
-                        "Please purchase a license to continue.")
-                    # Force license check
-                    dlg = LicenseDialog(machine_id)
-                    if dlg.exec_() == QDialog.Accepted:
-                        is_registered = True
-                    else: # type: ignore
-                        sys.exit(0)
-                else:
-                    # Check for clock manipulation (Time moved backwards)
-                    if current_ts < last_run_ts:
-                        QMessageBox.critical(None, "Security Error", "System clock manipulation detected!\n(រកឃើញការកែម៉ោងថយក្រោយ)\nTrial mode disabled.")
-                        # Force license check
-                        dlg = LicenseDialog(machine_id)
-                        if dlg.exec_() == QDialog.Accepted:
-                            is_registered = True
-                        else: # type: ignore
-                            sys.exit(0)
-                    else:
-                        # Update last run
-                        try:
-                            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, reg_path, 0, winreg.KEY_WRITE)
-                            winreg.SetValueEx(key, "LastRun", 0, winreg.REG_SZ, str(current_ts))
-                            # Update hash in case it wasn't there (backward compatibility)
-                            if not stored_hash:
-                                trial_hash = get_secure_trial_hash(machine_id, first_run_ts)
-                                winreg.SetValueEx(key, "TrialHash", 0, winreg.REG_SZ, trial_hash)
-                            winreg.CloseKey(key) # type: ignore
-                        except Exception:
-                            pass
-
-                        # Check duration
-                        first_run_date = datetime.datetime.fromtimestamp(first_run_ts)
-                        days_passed = (datetime.datetime.now() - first_run_date).days
-
-                        if days_passed < 7:
-                            is_registered = True # Trial active
-                        else:
-                            # Trial expired
-                            dlg = LicenseDialog(machine_id)
-                            if dlg.exec_() == QDialog.Accepted:
-                                is_registered = True
-                            else: # type: ignore
-                                sys.exit(0)
+                sys.exit(0)
         # --- License Check End ---
         
         if is_registered:

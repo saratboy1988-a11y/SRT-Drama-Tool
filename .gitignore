@@ -31,4 +31,5 @@ klite_codec_basic.exe
 
 autosave_backup*.json
 license.key
+license_server/*.db
 missing.index

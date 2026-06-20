@@ -15,7 +15,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
-IGNORE_DIRS = {"build", "build_gen", "dist", "installer_output", ".venv", "logs", "__pycache__"}
+IGNORE_DIRS = {
+    ".git", ".qwen", ".venv", ".venv-1", ".vscode",
+    "build", "build_gen", "dist", "dist_gen", "installer_output",
+    "logs", "__pycache__",
+}
 PYTHON_EXTENSIONS = {".py"}
 
 BUILTIN_NAMES = set(dir(__builtins__))
@@ -67,14 +71,16 @@ class Normalizer(ast.NodeTransformer):
 
 
 def iter_source_files(root: Path, extensions: Set[str]) -> Iterable[Path]:
-    for path in root.rglob("*"):
-        if path.is_dir():
-            if path.name in IGNORE_DIRS:
-                continue
-        elif path.suffix.lower() in extensions:
-            if any(part in IGNORE_DIRS for part in path.parts):
-                continue
-            yield path
+    for current_root, dir_names, file_names in os.walk(root):
+        dir_names[:] = [
+            name for name in dir_names
+            if name not in IGNORE_DIRS and not name.startswith(".venv")
+        ]
+        current_path = Path(current_root)
+        for file_name in file_names:
+            path = current_path / file_name
+            if path.suffix.lower() in extensions:
+                yield path
 
 
 def get_function_nodes(tree: ast.AST, file_path: Path) -> Iterable[Tuple[str, ast.AST, int]]:
@@ -109,7 +115,7 @@ def normalize_function(node: ast.AST) -> Tuple[str, str]:
 
 
 def parse_file(path: Path) -> List[FunctionInfo]:
-    with path.open("r", encoding="utf-8", errors="ignore") as f:
+    with path.open("r", encoding="utf-8-sig", errors="ignore") as f:
         source = f.read()
     try:
         tree = ast.parse(source)

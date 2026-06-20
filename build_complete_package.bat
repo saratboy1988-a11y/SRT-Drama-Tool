@@ -2,6 +2,24 @@
 chcp 65001 >nul
 title Build Complete Package - SRT Drama Tool
 cd /d "%~dp0"
+set "APP_DIST_DIR=dist\SRT Drama Tool"
+set "APP_EXE=%APP_DIST_DIR%\SRT Drama Tool.exe"
+set "PYTHON_CMD="
+if exist ".venv\Scripts\python.exe" set "PYTHON_CMD=.venv\Scripts\python.exe"
+if not defined PYTHON_CMD (
+    py -3 --version >nul 2>&1
+    if not errorlevel 1 set "PYTHON_CMD=py -3"
+)
+if not defined PYTHON_CMD (
+    python --version >nul 2>&1
+    if not errorlevel 1 set "PYTHON_CMD=python"
+)
+
+if not defined PYTHON_CMD (
+    echo [ERROR] Python 3 was not found. Install Python 3.10+ or create .venv first.
+    pause
+    exit /b 1
+)
 
 echo ====================================================================
 echo     COMPLETE BUILD PACKAGE FOR SRT DRAMA TOOL
@@ -22,10 +40,10 @@ echo ====================================================================
 echo.
 
 echo Checking PyInstaller...
-python -c "import PyInstaller" 2>nul
+%PYTHON_CMD% -c "import PyInstaller" 2>nul
 if errorlevel 1 (
     echo [WARNING] PyInstaller not found. Attempting to install...
-    pip install pyinstaller
+    %PYTHON_CMD% -m pip install pyinstaller
     if errorlevel 1 (
         echo [ERROR] Failed to install PyInstaller automatically.
         pause
@@ -35,14 +53,20 @@ if errorlevel 1 (
 
 if exist "requirements.txt" (
     echo Installing requirements from requirements.txt...
-    pip install -r requirements.txt
+    %PYTHON_CMD% -m pip install -r requirements.txt
+    if errorlevel 1 (
+        echo [ERROR] Failed to install requirements.txt.
+        echo Please fix the package installation errors above before building.
+        pause
+        exit /b 1
+    )
 )
 
 echo Building main application...
-echo This may take 5-10 minutes...
+echo This may take 10-30 minutes because Demucs AI/PyTorch packages are bundled...
 echo.
 
-pyinstaller --clean "SRT Drama Tool.spec"
+%PYTHON_CMD% -m PyInstaller --clean "SRT Drama Tool.spec"
 
 if %errorlevel% neq 0 (
     echo.
@@ -53,9 +77,9 @@ if %errorlevel% neq 0 (
 )
 
 :: Check if EXE was created
-if not exist "dist\SRT Drama Tool.exe" (
+if not exist "%APP_EXE%" (
     echo.
-    echo [ERROR] Main application EXE not found in dist folder!
+    echo [ERROR] Main application EXE not found: %APP_EXE%
     echo Build may have failed due to recursion errors or missing dependencies.
     echo.
     pause
@@ -67,7 +91,7 @@ echo ====================================================================
 echo     STEP 1 COMPLETE!
 echo ====================================================================
 echo Main application built successfully!
-echo Output: dist\SRT Drama Tool.exe
+echo Output: %APP_EXE%
 echo.
 
 :: ============================================================================
@@ -82,50 +106,50 @@ echo Copying required files to dist folder...
 
 :: Copy install_ffmpeg.py (not compiled, runs as Python script)
 if exist "install_ffmpeg.py" (
-    copy /Y "install_ffmpeg.py" "dist\" >nul 2>&1
+    copy /Y "install_ffmpeg.py" "%APP_DIST_DIR%\" >nul 2>&1
     echo   + install_ffmpeg.py
 )
 
 :: Copy splash_logo.png (Required for startup)
 if exist "splash_logo.png" (
-    copy /Y "splash_logo.png" "dist\" >nul 2>&1
+    copy /Y "splash_logo.png" "%APP_DIST_DIR%\" >nul 2>&1
     echo   + splash_logo.png
 )
 
 :: Copy app_settings.json (if exists, don't overwrite if already there)
 if exist "app_settings.json" (
-    if not exist "dist\app_settings.json" (
-        copy /Y "app_settings.json" "dist\" >nul 2>&1
+    if not exist "%APP_DIST_DIR%\app_settings.json" (
+        copy /Y "app_settings.json" "%APP_DIST_DIR%\" >nul 2>&1
         echo   + app_settings.json
     )
 )
 
 :: Copy version.txt
 if exist "version.txt" (
-    copy /Y "version.txt" "dist\" >nul 2>&1
+    copy /Y "version.txt" "%APP_DIST_DIR%\" >nul 2>&1
     echo   + version.txt
 )
 
 :: Copy requirements.txt
 if exist "requirements.txt" (
-    copy /Y "requirements.txt" "dist\" >nul 2>&1
+    copy /Y "requirements.txt" "%APP_DIST_DIR%\" >nul 2>&1
     echo   + requirements.txt
 )
 
 :: Copy ffmpeg.exe and ffprobe.exe (if they exist in current folder)
 if exist "ffmpeg.exe" (
-    copy /Y "ffmpeg.exe" "dist\" >nul 2>&1
+    copy /Y "ffmpeg.exe" "%APP_DIST_DIR%\" >nul 2>&1
     echo   + ffmpeg.exe
 )
 if exist "ffprobe.exe" (
-    copy /Y "ffprobe.exe" "dist\" >nul 2>&1
+    copy /Y "ffprobe.exe" "%APP_DIST_DIR%\" >nul 2>&1
     echo   + ffprobe.exe
 )
 
 :: Copy FFmpeg DLLs (if any)
 for %%f in (*.dll) do (
     if exist "%%f" (
-        copy /Y "%%f" "dist\" >nul 2>&1
+        copy /Y "%%f" "%APP_DIST_DIR%\" >nul 2>&1
         echo   + %%f
     )
 )
@@ -154,14 +178,14 @@ if /i "%build_license%"=="Y" (
         if exist "build_license_gen.bat" (
             call build_license_gen.bat
         ) else (
-            pyinstaller --clean --distpath=dist_gen --workpath=build_gen --specpath=build_gen LicenseGen.spec 2>nul
+            %PYTHON_CMD% -m PyInstaller --clean --distpath=dist_gen --workpath=build_gen --specpath=build_gen LicenseGenerator.spec 2>nul
             if errorlevel 1 (
                 echo [ERROR] Failed to build License Generator!
             ) else (
                 echo License Generator built successfully!
                 if exist "dist_gen\LicenseGenerator.exe" (
-                    copy /Y "dist_gen\LicenseGenerator.exe" "dist\" >nul 2>&1
-                    echo   + Copied to dist\LicenseGenerator.exe
+                    copy /Y "dist_gen\LicenseGenerator.exe" "%APP_DIST_DIR%\" >nul 2>&1
+                    echo   + Copied to %APP_DIST_DIR%\LicenseGenerator.exe
                 )
             )
         )
@@ -193,13 +217,13 @@ if /i not "%build_installer%"=="Y" (
 :: Check if Inno Setup is installed
 set INNO_PATH=
 if exist "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" (
-    set INNO_PATH="C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+    set "INNO_PATH=C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
 ) else if exist "C:\Program Files\Inno Setup 6\ISCC.exe" (
-    set INNO_PATH="C:\Program Files\Inno Setup 6\ISCC.exe"
+    set "INNO_PATH=C:\Program Files\Inno Setup 6\ISCC.exe"
 ) else if exist "C:\Program Files (x86)\Inno Setup 5\ISCC.exe" (
-    set INNO_PATH="C:\Program Files (x86)\Inno Setup 5\ISCC.exe"
+    set "INNO_PATH=C:\Program Files (x86)\Inno Setup 5\ISCC.exe"
 ) else if exist "C:\Program Files\Inno Setup 5\ISCC.exe" (
-    set INNO_PATH="C:\Program Files\Inno Setup 5\ISCC.exe"
+    set "INNO_PATH=C:\Program Files\Inno Setup 5\ISCC.exe"
 )
 
 if "%INNO_PATH%"=="" (
@@ -223,6 +247,12 @@ if "%INNO_PATH%"=="" (
 echo Found Inno Setup at: %INNO_PATH%
 echo.
 
+if not exist "%APP_DIST_DIR%\*" (
+    echo [ERROR] Distribution folder is missing: %APP_DIST_DIR%
+    echo Please finish Step 1 successfully before compiling the installer.
+    goto :skip_installer
+)
+
 :: Check if .iss file exists
 if not exist "SRT_Drama_Tool_Installer.iss" (
     echo [ERROR] Inno Setup script not found: SRT_Drama_Tool_Installer.iss
@@ -238,7 +268,7 @@ echo Compiling Inno Setup Installer...
 echo This may take a minute...
 echo.
 
-%INNO_PATH% "SRT_Drama_Tool_Installer.iss"
+"%INNO_PATH%" "SRT_Drama_Tool_Installer.iss"
 
 if %errorlevel% equ 0 (
     echo.
@@ -270,9 +300,9 @@ echo     BUILD PROCESS COMPLETE!
 echo ====================================================================
 echo.
 echo Files created:
-echo   [MAIN] dist\SRT Drama Tool.exe
-if exist "dist\install_ffmpeg.py" echo   [REQ]  dist\install_ffmpeg.py
-if exist "dist\LicenseGenerator.exe" echo   [OPT]  dist\LicenseGenerator.exe
+echo   [MAIN] %APP_EXE%
+if exist "%APP_DIST_DIR%\install_ffmpeg.py" echo   [REQ]  %APP_DIST_DIR%\install_ffmpeg.py
+if exist "%APP_DIST_DIR%\LicenseGenerator.exe" echo   [OPT]  %APP_DIST_DIR%\LicenseGenerator.exe
 if exist "installer_output\*.exe" echo   [SETUP] installer_output\*.exe
 echo.
 echo ====================================================================
@@ -295,7 +325,7 @@ echo ====================================================================
 :: Ask to open dist folder
 set /p open_dist="Open dist folder now? (Y/N): "
 if /i "%open_dist%"=="Y" (
-    explorer "dist"
+    explorer "%APP_DIST_DIR%"
 )
 
 pause

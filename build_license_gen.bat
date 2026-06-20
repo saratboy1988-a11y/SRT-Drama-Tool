@@ -9,20 +9,29 @@ echo    Developer: Nou Sarat
 echo ======================================================
 echo.
 
-:: Check Python installation
-where python >nul 2>&1
-if %errorlevel% neq 0 (
-    echo [ERROR] Python is not installed or not in PATH!
+set "PYTHON_CMD="
+if exist ".venv\Scripts\python.exe" set "PYTHON_CMD=.venv\Scripts\python.exe"
+if not defined PYTHON_CMD (
+    py -3 --version >nul 2>&1
+    if not errorlevel 1 set "PYTHON_CMD=py -3"
+)
+if not defined PYTHON_CMD (
+    python --version >nul 2>&1
+    if not errorlevel 1 set "PYTHON_CMD=python"
+)
+
+if not defined PYTHON_CMD (
+    echo [ERROR] Python 3 is not installed or not in PATH!
     pause
     exit /b 1
 )
 
 echo [1/4] Checking Python version...
-python --version
+%PYTHON_CMD% --version
 echo.
 
 echo [2/4] Installing requirements...
-pip install pyinstaller PyQt5
+%PYTHON_CMD% -m pip install pyinstaller PyQt5
 if %errorlevel% neq 0 (
     echo [ERROR] Failed to install requirements!
     pause
@@ -41,7 +50,7 @@ echo [4/4] Building LicenseGenerator EXE...
 echo Please wait...
 echo.
 
-pyinstaller --noconfirm --onefile --windowed --clean ^
+%PYTHON_CMD% -m PyInstaller --noconfirm --onefile --windowed --clean ^
  --name "LicenseGenerator" ^
  --workpath "build_gen" ^
  --distpath "dist_gen" ^

@@ -3,6 +3,7 @@
 # Fix RecursionError: Increase recursion limit BEFORE anything else
 import sys
 sys.setrecursionlimit(5000)
+from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs, collect_submodules
 
 # Manually collect edge_tts dependencies (avoid collect_all which pulls too much)
 datas = [
@@ -24,7 +25,12 @@ datas = [
     ('splash_logo.png', '.'),
 ]
 
+for package_name in ('demucs', 'dora', 'omegaconf', 'openunmix', 'julius'):
+    datas += collect_data_files(package_name)
+
 binaries = []
+for package_name in ('torchaudio', 'torch'):
+    binaries += collect_dynamic_libs(package_name)
 
 hiddenimports = [
     'edge_tts',
@@ -38,8 +44,21 @@ hiddenimports = [
     'pygame.mixer',
     'aiohttp',
     'certifi',
+    'torch',
+    'torchaudio',
+    'demucs',
+    'demucs.separate',
+    'openunmix',
+    'julius',
+    'lameenc',
+    'einops',
+    'dora',
+    'omegaconf',
     # asyncio is stdlib - do NOT add to hiddenimports (causes circular import)
 ]
+
+for package_name in ('demucs', 'dora', 'omegaconf', 'openunmix', 'julius'):
+    hiddenimports += collect_submodules(package_name)
 
 a = Analysis(
     ['SRT Drama Tool.py'],
@@ -94,7 +113,7 @@ coll = COLLECT(
     a.binaries,
     a.datas,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     name='SRT Drama Tool',
 )

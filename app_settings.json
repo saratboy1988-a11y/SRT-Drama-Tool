@@ -28,5 +28,8 @@
   "ffprobe_path": "D:\\RVC_Tools\\FFmpeg\\bin\\ffprobe.exe",
   "ffmpeg_bin_dir": "D:\\RVC_Tools\\FFmpeg\\bin",
   "ffmpeg_auto_detect": true,
-  "update_url": "https://github.com/saratboy1988-a11y/SRT-Drama-Tool/releases/latest"
+  "update_url": "https://github.com/saratboy1988-a11y/SRT-Drama-Tool/releases/latest",
+  "dub_audio_lead_ms": 0,
+  "tts_engine_mode": "edge",
+  "voxcpm2_enabled": false
 }

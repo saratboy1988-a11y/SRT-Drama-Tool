@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-RVC Tool - ផ្ទៀងផ្ទាត់ការដំឡើង
+SRT Drama Tool - ផ្ទៀងផ្ទាត់ការដំឡើង
 ពិនិត្យមើលថាតើគ្រប់សមាសធាតុទាំងអស់ត្រូវបានដំឡើងត្រឹមត្រូវឬអត់
 """
 
@@ -9,7 +9,13 @@ import sys
 import platform
 import subprocess
 import json
+import glob
 from pathlib import Path
+
+for stream_name in ("stdout", "stderr"):
+    stream = getattr(sys, stream_name, None)
+    if stream and hasattr(stream, "reconfigure"):
+        stream.reconfigure(encoding="utf-8", errors="replace")
 
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -45,9 +51,10 @@ def check_required_files():
     }
 
     required_files = [
-        "RVC Tool.py",
+        "SRT Drama Tool.py",
         "app_settings.json",
         "rvc_config.json",
+        "role_configs.json",
         "requirements.txt",
         "download_models.py",
         "install_ffmpeg.py",
@@ -83,7 +90,8 @@ def check_python_packages():
         "PyQt5",
         "edge_tts",
         "pydub",
-        "gradio_client"
+        "pygame",
+        "PIL"
     ]
 
     for package in required_packages:
@@ -127,15 +135,19 @@ def check_ffmpeg():
         os.path.expanduser("~\\RVC_Tools\\FFmpeg\\bin")
     ]
 
-    # Add PATH directories
+    # Add PATH directories and the FFmpeg binary bundled by PyInstaller.
     search_paths.extend(os.environ.get("PATH", "").split(os.pathsep))
+    ffmpeg_candidates = [
+        os.path.join(path, "ffmpeg.exe")
+        for path in search_paths
+        if path
+    ]
+    ffmpeg_candidates.extend(sorted(glob.glob(
+        os.path.join(SCRIPT_DIR, "_internal", "imageio_ffmpeg", "binaries", "ffmpeg*.exe")
+    )))
 
     # Find ffmpeg.exe
-    for path in search_paths:
-        if not path or not os.path.exists(path):
-            continue
-
-        ffmpeg_exe = os.path.join(path, "ffmpeg.exe")
+    for ffmpeg_exe in ffmpeg_candidates:
         if os.path.exists(ffmpeg_exe):
             result["ffmpeg_path"] = ffmpeg_exe
             result["passed"] = True
@@ -156,7 +168,7 @@ def check_ffmpeg():
                 pass
 
             # Find ffprobe
-            ffprobe_exe = os.path.join(path, "ffprobe.exe")
+            ffprobe_exe = os.path.join(os.path.dirname(ffmpeg_exe), "ffprobe.exe")
             if os.path.exists(ffprobe_exe):
                 result["ffprobe_path"] = ffprobe_exe
 
@@ -319,7 +331,7 @@ def check_disk_space():
 def run_all_checks():
     """ដំណើរការការត្រួតពិនិត្យទាំងអស់"""
     print(f"\n{'='*60}")
-    print("RVC Tool - ផ្ទៀងផ្ទាត់ការដំឡើង")
+    print("SRT Drama Tool - ផ្ទៀងផ្ទាត់ការដំឡើង")
     print(f"{'='*60}\n")
     print(f"ថតដំឡើង: {SCRIPT_DIR}")
     print(f"ប្រព័ន្ធ: {platform.system()} {platform.release()}")
@@ -389,7 +401,7 @@ def run_all_checks():
     print(f"✗ បរាជ័យ: {failed}\n")
 
     if failed == 0:
-        print("🎉 ការដំឡើង RVC Tool ត្រឹមត្រូវទាំងអស់!")
+        print("🎉 ការដំឡើង SRT Drama Tool ត្រឹមត្រូវទាំងអស់!")
         print("   → អ្នកអាចចាប់ផ្តើមប្រើប្រាស់បានហើយ\n")
     else:
         print("⚠ មានបញ្ហាដែលត្រូវដោះស្រាយ:\n")
@@ -412,7 +424,7 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="RVC Tool - ផ្ទៀងផ្ទាត់ការដំឡើង",
+        description="SRT Drama Tool - ផ្ទៀងផ្ទាត់ការដំឡើង",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 ឧទាហរណ៍:
@@ -434,7 +446,7 @@ def main():
 
     if args.quick:
         print(f"\n{'='*60}")
-        print("RVC Tool - ការត្រួតពិនិត្យរហ័ស")
+        print("SRT Drama Tool - ការត្រួតពិនិត្យរហ័ស")
         print(f"{'='*60}\n")
 
         print("ពិនិត្យ FFmpeg...")

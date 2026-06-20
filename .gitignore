@@ -32,4 +32,5 @@ klite_codec_basic.exe
 autosave_backup*.json
 license.key
 license_server/*.db
+voxcpm_info.json
 missing.index

@@ -1,19 +1,18 @@
 ; ============================================================================
 ; Inno Setup Script for SRT Drama Tool
 ; Developer: Nou Sarat
-; Version: 1.1.0
+; Version: 1.1.1
 ; ============================================================================
 
 #define MyAppName "SRT Drama Tool"
-#define MyAppVersion "1.1.0"
+#define MyAppVersion "1.1.1"
 #define MyAppPublisher "Nou Sarat"
 #define MyAppURL "https://github.com/saratboy1988-a11y/SRT-Drama-Tool/releases/latest"
 #define MyAppExeName "SRT Drama Tool.exe"
 #define MyAppContact "096 22 11 947"
 
 [Setup]
-; Basic Setup Information
-AppId={{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}}
+AppId={{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppVerName={#MyAppName} v{#MyAppVersion} PRO
@@ -21,43 +20,34 @@ AppPublisher={#MyAppPublisher}
 AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}
 AppUpdatesURL={#MyAppURL}
-VersionInfoVersion=1.1.0.0
+VersionInfoVersion=1.1.1.0
 VersionInfoCopyright=Copyright (c) 2024-2026 {#MyAppPublisher}
 VersionInfoDescription=Professional SRT Subtitle and Voice Tool with AI RVC
 VersionInfoProductName={#MyAppName}
-VersionInfoProductVersion=1.1.0
+VersionInfoProductVersion=1.1.1
 
-; Installation Settings
 DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
 AllowNoIcons=yes
-LicenseFile=
-InfoBeforeFile=
 OutputDir=installer_output
 OutputBaseFilename=SRT_Drama_Tool_v{#MyAppVersion}_Setup
 UninstallDisplayIcon={app}\{#MyAppExeName}
 
-; Compression
-Compression=lzma2/ultra64
-SolidCompression=yes
+Compression=lzma2/normal
+SolidCompression=no
 CompressionThreads=auto
 
-; User Interface
 WizardStyle=modern
 WizardSizePercent=100,100
 SetupIconFile=logo.ico
-WizardImageFile=
-WizardSmallImageFile=
 DisableWelcomePage=no
 ShowLanguageDialog=no
 
-; Privileges and Architecture
 PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=6.1sp1
 
-; Other Settings
 DisableDirPage=auto
 DisableProgramGroupPage=auto
 DisableReadyPage=no
@@ -88,7 +78,7 @@ Source: "srt_drama_tool.png"; DestDir: "{app}"; Flags: ignoreversion
 ; Helper Scripts
 Source: "License Server Launcher.py"; DestDir: "{app}"; Flags: ignoreversion
 Source: "Run License Server.bat"; DestDir: "{app}"; Flags: ignoreversion
-Source: "license_server\*"; DestDir: "{app}\license_server"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "license_server\*"; DestDir: "{app}\license_server"; Excludes: "*.db,*.db-*,*.pyc,__pycache__\*"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "install_ffmpeg.py"; DestDir: "{app}"; Flags: ignoreversion
 Source: "install_pytorch.py"; DestDir: "{app}"; Flags: ignoreversion
 Source: "verify_installation.py"; DestDir: "{app}"; Flags: ignoreversion
@@ -99,27 +89,22 @@ Source: "download_models.py"; DestDir: "{app}"; Flags: ignoreversion
 Source: "*.md"; DestDir: "{app}\docs"; Flags: ignoreversion
 
 [Icons]
-; Start Menu Icons
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
 Name: "{group}\Run License Server"; Filename: "{app}\Run License Server.bat"; WorkingDir: "{app}"
 Name: "{group}\{cm:UninstallProgram,{#MyAppName}}"; Filename: "{uninstallexe}"
 Name: "{group}\Documentation"; Filename: "{app}\docs"; Check: DirExists(ExpandConstant('{app}\docs'))
-
-; Desktop Icon
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Run]
-; Launch application after installation
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent unchecked
 
 [UninstallDelete]
-; Clean up user data on uninstall
 Type: filesandordirs; Name: "{app}\docs"
 Type: files; Name: "{app}\*.pyc"
-Type: files; Name: "{app}\__pycache__"
+Type: filesandordirs; Name: "{app}\__pycache__"
 
 [Registry]
-; Register file associations (optional - for .dtp files)
+; File associations are intentionally disabled for now.
 ; Root: HKA; Subkey: "Software\Classes\.dtp"; ValueType: string; ValueName: ""; ValueData: "{#MyAppName}.Project"; Flags: uninsdeletevalue
 ; Root: HKA; Subkey: "Software\Classes\{#MyAppName}.Project"; ValueType: string; ValueName: ""; ValueData: "{#MyAppName} Project File"; Flags: uninsdeletekey
 ; Root: HKA; Subkey: "Software\Classes\{#MyAppName}.Project\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\{#MyAppExeName},0"
@@ -138,15 +123,22 @@ end;
 
 procedure InitializeWizard;
 begin
-  // Create download page for FFmpeg if needed
   DownloadPage := CreateDownloadPage(SetupMessage(msgWizardPreparing), SetupMessage(msgPreparingDesc), @OnDownloadProgress);
 end;
 
 function InitializeSetup(): Boolean;
 begin
   Result := True;
-  
-  // Check if minimum Windows version is met
+
+  if not FileExists(ExpandConstant('{src}\dist\{#MyAppName}\{#MyAppExeName}')) then
+  begin
+    MsgBox('Build output was not found:' + #13#10 +
+           ExpandConstant('{src}\dist\{#MyAppName}\{#MyAppExeName}') + #13#10#13#10 +
+           'Please run build_complete_package.bat first.', mbError, MB_OK);
+    Result := False;
+    Exit;
+  end;
+
   if not IsWin64 then
   begin
     MsgBox('This application requires 64-bit Windows 7 or later.', mbError, MB_OK);
@@ -158,12 +150,8 @@ procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then
   begin
-    // Set permissions for the installation folder
     if not IsAdmin then
-    begin
-      // For non-admin installs, ensure user has write permissions
-      Log('Setting folder permissions for user access');
-    end;
+      Log('Non-admin install: using user-writable install location.');
   end;
 end;
 
@@ -173,35 +161,28 @@ var
 begin
   if CurUninstallStep = usUninstall then
   begin
-    // Ask user if they want to keep their settings
     if UninstallSilent then
       UserChoice := IDYES
     else
       UserChoice := MsgBox('Do you want to keep your settings and configurations?' + #13#10 +
-                         '(សូមរក្សាទុកការកំណត់របស់អ្នក?)', 
-                         mbConfirmation, MB_YESNO or MB_DEFBUTTON1);
-    
+                           '(សូមរក្សាទុកការកំណត់របស់អ្នក?)',
+                           mbConfirmation, MB_YESNO or MB_DEFBUTTON1);
+
     if UserChoice = IDYES then
     begin
-      // Keep configuration files
       Log('User chose to keep settings');
-      // Files marked with uninsneveruninstall will be preserved
     end
     else
     begin
       Log('User chose to delete all settings');
-      // Remove the uninsneveruninstall flag by deleting manually
       DeleteFile(ExpandConstant('{app}\app_settings.json'));
       DeleteFile(ExpandConstant('{app}\role_configs.json'));
       DeleteFile(ExpandConstant('{app}\rvc_config.json'));
     end;
   end;
-  
+
   if CurUninstallStep = usPostUninstall then
-  begin
-    // Clean up any remaining files
     Log('Uninstallation completed');
-  end;
 end;
 
 function GetUninstallString(): String;
@@ -244,12 +225,11 @@ procedure CurPageChanged(CurPageID: Integer);
 begin
   if CurPageID = wpReady then
   begin
-    // Check for previous installation
     if IsUpgrade() then
     begin
       if WizardSilent or
          (MsgBox('A previous version is detected. It will be uninstalled before continuing.' + #13#10 +
-                '(មាន version ចាស់។ វានឹងត្រូវបាន uninstall មុនពេល install ថ្មី)',
+                 '(មាន version ចាស់។ វានឹងត្រូវ uninstall មុនពេល install ថ្មី)',
                  mbConfirmation, MB_YESNO or MB_DEFBUTTON1) = IDYES) then
       begin
         UnInstallOldVersion();

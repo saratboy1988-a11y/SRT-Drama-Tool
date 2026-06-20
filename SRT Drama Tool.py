@@ -129,16 +129,21 @@ def resource_path(relative_path):
 # Priority: version.txt > Git tag > Hardcoded fallback
 def get_app_version():
     """Get app version dynamically from version.txt or Git tag"""
-    # Try to read from version.txt first
-    version_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "version.txt")
-    if os.path.exists(version_file):
+    version_candidates = []
+    if getattr(sys, "frozen", False):
+        version_candidates.append(os.path.join(os.path.dirname(sys.executable), "version.txt"))
+    version_candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "version.txt"))
+
+    for version_file in version_candidates:
+        if not os.path.exists(version_file):
+            continue
         try:
             with open(version_file, "r") as f:
                 version = f.read().strip()
                 if version:
                     return version
         except:
-            pass
+            continue
     
     # Try to get from Git tag
     try:

@@ -127,6 +127,7 @@ if exist "app_settings.json" (
 :: Copy version.txt
 if exist "version.txt" (
     copy /Y "version.txt" "%APP_DIST_DIR%\" >nul 2>&1
+    if exist "%APP_DIST_DIR%\_internal\" copy /Y "version.txt" "%APP_DIST_DIR%\_internal\" >nul 2>&1
     echo   + version.txt
 )
 

@@ -130,15 +130,6 @@ function InitializeSetup(): Boolean;
 begin
   Result := True;
 
-  if not FileExists(ExpandConstant('{src}\dist\{#MyAppName}\{#MyAppExeName}')) then
-  begin
-    MsgBox('Build output was not found:' + #13#10 +
-           ExpandConstant('{src}\dist\{#MyAppName}\{#MyAppExeName}') + #13#10#13#10 +
-           'Please run build_complete_package.bat first.', mbError, MB_OK);
-    Result := False;
-    Exit;
-  end;
-
   if not IsWin64 then
   begin
     MsgBox('This application requires 64-bit Windows 7 or later.', mbError, MB_OK);

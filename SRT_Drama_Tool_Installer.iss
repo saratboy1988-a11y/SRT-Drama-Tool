@@ -1,18 +1,18 @@
 ; ============================================================================
 ; Inno Setup Script for SRT Drama Tool
 ; Developer: Nou Sarat
-; Version: 1.1.2
+; Version: 1.1.3
 ; ============================================================================
 
 #define MyAppName "SRT Drama Tool"
-#define MyAppVersion "1.1.2"
+#define MyAppVersion "1.1.3"
 #define MyAppPublisher "Nou Sarat"
 #define MyAppURL "https://github.com/saratboy1988-a11y/SRT-Drama-Tool/releases/latest"
 #define MyAppExeName "SRT Drama Tool.exe"
 #define MyAppContact "096 22 11 947"
 
 [Setup]
-AppId={{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}}
+AppId={{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppVerName={#MyAppName} v{#MyAppVersion} PRO
@@ -20,11 +20,11 @@ AppPublisher={#MyAppPublisher}
 AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}
 AppUpdatesURL={#MyAppURL}
-VersionInfoVersion=1.1.2.0
+VersionInfoVersion=1.1.3.0
 VersionInfoCopyright=Copyright (c) 2024-2026 {#MyAppPublisher}
 VersionInfoDescription=Professional SRT Subtitle and Voice Tool with AI RVC
 VersionInfoProductName={#MyAppName}
-VersionInfoProductVersion=1.1.2
+VersionInfoProductVersion=1.1.3
 
 DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
@@ -176,40 +176,53 @@ begin
     Log('Uninstallation completed');
 end;
 
-function GetUninstallString(): String;
+function GetUninstallStringForKey(const UninstallKey: String): String;
 var
-  sUnInstPath: String;
   sUnInstallString: String;
 begin
-  sUnInstPath := ExpandConstant('Software\Microsoft\Windows\CurrentVersion\Uninstall\{#emit SetupSetting("AppId")}_is1');
   sUnInstallString := '';
-  if not RegQueryStringValue(HKLM, sUnInstPath, 'UninstallString', sUnInstallString) then
-    RegQueryStringValue(HKCU, sUnInstPath, 'UninstallString', sUnInstallString);
+  if not RegQueryStringValue(HKLM, UninstallKey, 'UninstallString', sUnInstallString) then
+    RegQueryStringValue(HKCU, UninstallKey, 'UninstallString', sUnInstallString);
   Result := sUnInstallString;
+end;
+
+function GetUninstallString(): String;
+begin
+  Result := GetUninstallStringForKey(
+    'Software\Microsoft\Windows\CurrentVersion\Uninstall\{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}_is1');
+end;
+
+function GetLegacyUninstallString(): String;
+begin
+  Result := GetUninstallStringForKey(
+    'Software\Microsoft\Windows\CurrentVersion\Uninstall\{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}}_is1');
 end;
 
 function IsUpgrade(): Boolean;
 begin
-  Result := (GetUninstallString() <> '');
+  Result := (GetUninstallString() <> '') or (GetLegacyUninstallString() <> '');
 end;
 
-function UnInstallOldVersion(): Integer;
+function RunUninstaller(const UninstallString: String): Boolean;
 var
   sUnInstallString: String;
   iResultCode: Integer;
 begin
-  Result := 0;
-  sUnInstallString := GetUninstallString();
+  Result := True;
+  sUnInstallString := UninstallString;
   if sUnInstallString <> '' then
   begin
     sUnInstallString := RemoveQuotes(sUnInstallString);
-    if Exec(sUnInstallString, '/SILENT /NORESTART /SUPPRESSMSGBOXES', '', SW_HIDE, ewWaitUntilTerminated, iResultCode) then
-      Result := 3
-    else
-      Result := 2;
-  end
-  else
-    Result := 1;
+    Result := Exec(sUnInstallString, '/SILENT /NORESTART /SUPPRESSMSGBOXES', '', SW_HIDE,
+      ewWaitUntilTerminated, iResultCode) and (iResultCode = 0);
+  end;
+end;
+
+function UnInstallOldVersion(): Boolean;
+begin
+  Result := RunUninstaller(GetUninstallString());
+  if not RunUninstaller(GetLegacyUninstallString()) then
+    Result := False;
 end;
 
 procedure CurPageChanged(CurPageID: Integer);

@@ -1,6 +1,6 @@
 ﻿# -*- coding: utf-8 -*-
 """
-SRT Drama Tool v1.1.3
+SRT Drama Tool v1.1.4
 PART 1 - Core UI + Light Accent Theme
 Author: NOU SARAT
 """
@@ -161,7 +161,7 @@ def get_app_version():
         pass
     
     # Fallback to hardcoded version
-    return "1.1.3"
+    return "1.1.4"
 
 APP_VERSION = get_app_version()
 APP_NAME = "SRT Drama Tool"
@@ -1939,6 +1939,8 @@ class MainWindow(QMainWindow):
         self.ffmpeg_path = None  # QLineEdit for ffmpeg path (created in settings tab)
         self.output_folder = None  # QLineEdit for output folder (created in export tab)
         self.ad_video_path_input = None  # QLineEdit for optional end-card/ad video
+        self.ad_video_list = None  # QListWidget for rotating end-card/ad videos
+        self.ad_video_position_combo = None
         self.chk_marquee_text = None
         self.txt_marquee_text = None
         self.cb_marquee_position = None
@@ -2324,6 +2326,13 @@ class MainWindow(QMainWindow):
         def run_and_cleanup():
             try:
                 target(*args)
+            except Exception as exc:
+                target_name = getattr(target, "__name__", "background worker")
+                self.safe_log(f"❌ {target_name} crashed: {exc}")
+                self.safe_log(traceback.format_exc())
+                if target_name == "run_auto_export_thread":
+                    self.srt_finished_signal.emit()
+                    self.export_finished_signal.emit()
             finally:
                 current = threading.current_thread()
                 with self.worker_threads_lock:
@@ -4023,7 +4032,7 @@ class MainWindow(QMainWindow):
                 border: 1px solid #dbe3ef;
                 border-radius: 8px;
             }
-            QFrame#ttsOptions QComboBox {
+            QFrame#ttsOptions QComboBox, QFrame#ttsOptions QSpinBox {
                 background-color: #ffffff;
                 color: #0f172a;
                 border: 1px solid #cbd5e1;
@@ -4031,7 +4040,7 @@ class MainWindow(QMainWindow):
                 padding: 6px 10px;
                 min-height: 20px;
             }
-            QFrame#ttsOptions QComboBox:focus {
+            QFrame#ttsOptions QComboBox:focus, QFrame#ttsOptions QSpinBox:focus {
                 border: 1px solid #2563eb;
             }
         """)
@@ -4050,6 +4059,18 @@ class MainWindow(QMainWindow):
         self.home_tts_engine_combo.setCurrentIndex(max(0, engine_index))
         self.home_tts_engine_combo.currentIndexChanged.connect(self._on_home_tts_engine_changed)
         tts_scope_layout.addWidget(self.home_tts_engine_combo)
+
+        self.tts_workers_label = QLabel("TTS Workers")
+        tts_scope_layout.addWidget(self.tts_workers_label)
+        self.tts_workers_spin = QSpinBox()
+        self.tts_workers_spin.setRange(1, 6)
+        self.tts_workers_spin.setValue(max(1, min(6, coerce_int(self.app_settings.get("edge_tts_workers"), 2))))
+        self.tts_workers_spin.setFixedWidth(58)
+        self.tts_workers_spin.setToolTip(
+            "Concurrent Standard Edge TTS requests. 3-4 is recommended; 5-6 may trigger rate-limit retries."
+        )
+        self.tts_workers_spin.valueChanged.connect(self._on_tts_workers_changed)
+        tts_scope_layout.addWidget(self.tts_workers_spin)
 
         self.home_voxcpm2_frame = QFrame()
         self.home_voxcpm2_frame.setObjectName("homeVoxCPM2Frame")
@@ -4315,7 +4336,7 @@ class MainWindow(QMainWindow):
         self.timeline_zoom_label.setStyleSheet("color: #64748b; font-size: 8pt;")
         timeline_header.addWidget(self.timeline_zoom_label)
         timeline_header.addStretch()
-        self.btn_timeline_transcribe = QPushButton("Smart Khmer")
+        self.btn_timeline_transcribe = QPushButton("Transcribe To Khmer")
         self.btn_timeline_transcribe.setToolTip("If a CapCut SRT is loaded, preserve its timing and translate/tag only. If no SRT is loaded, transcribe the video from scratch.")
         self.btn_timeline_transcribe.setStyleSheet("background-color: #059669; color: white; font-weight: 700; border-radius: 5px; padding: 6px 12px;")
         self.btn_timeline_transcribe.clicked.connect(self._start_home_gemini_transcribe)
@@ -4356,6 +4377,7 @@ class MainWindow(QMainWindow):
         self.btn_timeline_audio.setStyleSheet("background-color: #4f46e5; color: white; font-weight: 700; border-radius: 5px; padding: 6px 12px;")
         self.btn_timeline_audio.clicked.connect(self.run_srt_conversion)
         timeline_header.addWidget(self.btn_timeline_audio)
+        self._refresh_timeline_engine_actions()
         table_layout.addLayout(timeline_header)
 
         self.timeline_widget = DubbingTimelineWidget(self)
@@ -4494,6 +4516,26 @@ class MainWindow(QMainWindow):
                 self.log(f"Loaded {len(cleaned)} cached generated audio clip(s)")
         except Exception:
             pass
+
+    def _reconcile_generated_audio_cache_with_table(self) -> None:
+        """Keep only cached clips that still match the currently loaded subtitle rows."""
+        cached = dict(getattr(self, "generated_audio_segments", {}) or {})
+        if not cached or not hasattr(self, "segment_table"):
+            return
+
+        compatible: dict[int, dict[str, Any]] = {}
+        for segment in self.get_segments_from_table():
+            row = int(segment.get("_row", -1))
+            if row >= 0 and self._generated_clip_path_for_segment(segment):
+                compatible[row] = cached[row]
+
+        self.generated_audio_segments = compatible
+        self._save_generated_audio_cache()
+        ignored = len(cached) - len(compatible)
+        if compatible:
+            self.log(f"♻️ Reusing {len(compatible)} cached audio clip(s) matching this subtitle file.")
+        if ignored:
+            self.log(f"ℹ️ Ignored {ignored} cached clip(s) from different or edited subtitle rows.")
 
     def _clear_generated_audio_cache(self, remove_files: bool = False) -> None:
         try:
@@ -4735,6 +4777,12 @@ class MainWindow(QMainWindow):
         self._refresh_timeline()
 
     def _on_segment_table_item_changed(self, *_args) -> None:
+        if (
+            getattr(self, "_loading_srt", False)
+            or getattr(self, "_suspend_undo_capture", False)
+            or getattr(self, "_restoring_table_state", False)
+        ):
+            return
         item = _args[0] if _args else None
         self._capture_table_item_change_for_undo()
         if isinstance(item, QTableWidgetItem) and item.column() == 0:
@@ -5080,30 +5128,66 @@ class MainWindow(QMainWindow):
 
         # Optional advertisement video appended after the exported video
         ad_layout = QVBoxLayout()
-        ad_group = self._create_styled_export_group("End Advertisement Video", ad_layout)
+        ad_group = self._create_styled_export_group("Advertisement Videos", ad_layout)
         ad_row = QHBoxLayout()
 
-        self.ad_video_path_input = QLineEdit(getattr(self, 'app_settings', {}).get("ad_video_path", ""))
-        self.ad_video_path_input.setPlaceholderText("Optional: select an ad video to append after export...")
-        self.ad_video_path_input.setStyleSheet("""
-            QLineEdit {
-                padding: 10px;
-                font-size: 11pt;
-                border: 2px solid #3498db;
+        self.ad_video_path_input = QLineEdit()
+        self.ad_video_path_input.setReadOnly(True)
+        self.ad_video_path_input.setVisible(False)
+
+        self.ad_video_list = QListWidget()
+        self.ad_video_list.setSelectionMode(QListWidget.ExtendedSelection)
+        self.ad_video_list.setMinimumHeight(92)
+        self.ad_video_list.setMaximumHeight(150)
+        self.ad_video_list.setToolTip("Each export uses the next video from a shuffled rotation without immediate repeats.")
+        self.ad_video_list.setStyleSheet("""
+            QListWidget {
+                background: #ffffff;
+                border: 1px solid #cbd5e1;
                 border-radius: 6px;
+                padding: 5px;
             }
+            QListWidget::item { padding: 5px; }
+            QListWidget::item:selected { background: #e9d5ff; color: #581c87; }
         """)
-        ad_row.addWidget(self.ad_video_path_input)
+        saved_ad_paths = self.app_settings.get("ad_video_paths", [])
+        if not isinstance(saved_ad_paths, list):
+            saved_ad_paths = []
+        legacy_ad_path = str(self.app_settings.get("ad_video_path", "") or "").strip()
+        if legacy_ad_path and legacy_ad_path not in saved_ad_paths:
+            saved_ad_paths.append(legacy_ad_path)
+        self._set_ad_video_paths(saved_ad_paths, save=False)
+        ad_layout.addWidget(self.ad_video_list)
+
+        ad_position_row = QHBoxLayout()
+        ad_position_row.addWidget(QLabel("Ad Position:"))
+        self.ad_video_position_combo = QComboBox()
+        self.ad_video_position_combo.addItem("Beginning of Video", "beginning")
+        self.ad_video_position_combo.addItem("Middle of Video", "middle")
+        self.ad_video_position_combo.addItem("End of Video", "end")
+        saved_ad_position = str(self.app_settings.get("ad_video_position", "end") or "end")
+        position_index = self.ad_video_position_combo.findData(saved_ad_position)
+        self.ad_video_position_combo.setCurrentIndex(position_index if position_index >= 0 else 2)
+        self.ad_video_position_combo.currentIndexChanged.connect(self._save_ad_video_position)
+        ad_position_row.addWidget(self.ad_video_position_combo, 1)
+        ad_layout.addLayout(ad_position_row)
 
         btn_ad_browse = self._create_styled_button(
-            "🎬 Browse", "#6f42c1", "#563d7c", "#563d7c", "#452c63",
+            "Add Videos", "#6f42c1", "#563d7c", "#563d7c", "#452c63",
             font_size="11pt", height=45, radius=6, padding="0 20px"
         )
         btn_ad_browse.clicked.connect(self.select_ad_video)
         ad_row.addWidget(btn_ad_browse)
 
+        btn_ad_remove = self._create_styled_button(
+            "Remove Selected", "#dc3545", "#b02a37", "#b02a37", "#842029",
+            font_size="11pt", height=45, radius=6, padding="0 16px"
+        )
+        btn_ad_remove.clicked.connect(self.remove_selected_ad_videos)
+        ad_row.addWidget(btn_ad_remove)
+
         btn_ad_clear = self._create_styled_button(
-            "Clear", "#6c757d", "#545b62", "#545b62", "#3d4246",
+            "Clear All", "#6c757d", "#545b62", "#545b62", "#3d4246",
             font_size="11pt", height=45, radius=6, padding="0 16px"
         )
         btn_ad_clear.clicked.connect(self.clear_ad_video)
@@ -8617,15 +8701,46 @@ class MainWindow(QMainWindow):
         if payload is not None:
             body = json.dumps(payload).encode("utf-8")
             request_headers.setdefault("Content-Type", "application/json")
-        request = urllib.request.Request(url, data=body, headers=request_headers, method=method or ("POST" if body is not None else "GET"))
-        try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                raw = response.read()
-                parsed = json.loads(raw.decode("utf-8")) if raw else {}
-                return parsed, response.headers
-        except urllib.error.HTTPError as e:
-            detail = e.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"Gemini API HTTP {e.code}: {detail[:600]}") from e
+        request_method = method or ("POST" if body is not None else "GET")
+        retry_delays = [5.0, 12.0, 25.0]
+        transient_codes = {429, 500, 502, 503, 504}
+
+        for attempt in range(len(retry_delays) + 1):
+            request = urllib.request.Request(url, data=body, headers=request_headers, method=request_method)
+            try:
+                with urllib.request.urlopen(request, timeout=timeout) as response:
+                    raw = response.read()
+                    parsed = json.loads(raw.decode("utf-8")) if raw else {}
+                    return parsed, response.headers
+            except urllib.error.HTTPError as e:
+                detail = e.read().decode("utf-8", errors="replace")
+                if e.code not in transient_codes or attempt >= len(retry_delays):
+                    raise RuntimeError(f"Gemini API HTTP {e.code}: {detail[:600]}") from e
+                delay = retry_delays[attempt]
+                try:
+                    retry_after = float(e.headers.get("Retry-After", "") or 0)
+                    if retry_after > 0:
+                        delay = min(60.0, retry_after)
+                except (TypeError, ValueError):
+                    pass
+                self.safe_log(
+                    f"⏳ Gemini service temporarily unavailable (HTTP {e.code}). "
+                    f"Retry {attempt + 1}/{len(retry_delays)} in {delay:.0f}s..."
+                )
+            except (urllib.error.URLError, TimeoutError, OSError) as e:
+                if attempt >= len(retry_delays):
+                    raise RuntimeError(f"Gemini network request failed: {e}") from e
+                delay = retry_delays[attempt]
+                self.safe_log(
+                    f"⏳ Gemini network connection was interrupted. "
+                    f"Retry {attempt + 1}/{len(retry_delays)} in {delay:.0f}s..."
+                )
+
+            stop_event = getattr(self, "gemini_stop_event", None)
+            if stop_event is not None and stop_event.wait(delay):
+                raise RuntimeError("Gemini job stopped by user.")
+
+        raise RuntimeError("Gemini request failed after automatic retries.")
 
     def _gemini_upload_file(self, api_key: str, media_path: str) -> dict[str, Any]:
         mime_type = mimetypes.guess_type(media_path)[0] or "application/octet-stream"
@@ -9611,6 +9726,29 @@ class MainWindow(QMainWindow):
         cleaned = re.sub(r"^[^:：]{1,40}[:：]\s*\S{0,40}\s*$", "", cleaned).strip()
         return not bool(cleaned)
 
+    def _count_khmer_chars(self, text: str) -> int:
+        return sum(1 for ch in str(text or "") if 0x1780 <= ord(ch) <= 0x17FF)
+
+    def _count_cjk_chars(self, text: str) -> int:
+        return sum(
+            1
+            for ch in str(text or "")
+            if (
+                0x3400 <= ord(ch) <= 0x4DBF
+                or 0x4E00 <= ord(ch) <= 0x9FFF
+                or 0xF900 <= ord(ch) <= 0xFAFF
+            )
+        )
+
+    def _looks_untranslated_for_khmer_tts(self, text: str) -> bool:
+        """Detect rows Gemini left in Chinese/CJK before sending them to Khmer TTS."""
+        cleaned = re.sub(r"^\[[^\]]{1,120}\]\s*", "", str(text or "").strip())
+        if not cleaned:
+            return False
+        khmer_count = self._count_khmer_chars(cleaned)
+        cjk_count = self._count_cjk_chars(cleaned)
+        return cjk_count >= 2 and khmer_count < max(2, cjk_count // 3)
+
     def clean_current_table_tags(self) -> None:
         """Clean speaker tags/metadata from current table text without changing timings."""
         if not hasattr(self, "segment_table"):
@@ -10042,7 +10180,7 @@ class MainWindow(QMainWindow):
         """Ask Gemini for only the source rows that were omitted from a translation."""
         translated_cues = self._parse_srt_text_blocks(translated_srt)
         source_cues = self._parse_srt_text_blocks(source_srt)
-        if not translated_cues or not source_cues or len(translated_cues) >= len(source_cues):
+        if not translated_cues or not source_cues:
             return translated_srt
 
         def cues_to_numbered_srt(cues: list[dict[str, Any]]) -> str:
@@ -10062,6 +10200,8 @@ class MainWindow(QMainWindow):
             text = str(cue.get("text", "") or "").strip()
             if self._is_effectively_empty_subtitle_text(text):
                 continue
+            if self._looks_untranslated_for_khmer_tts(text):
+                continue
             translated_by_number[number] = text
         missing_cues = [
             cue for index, cue in enumerate(source_cues, start=1)
@@ -10073,12 +10213,22 @@ class MainWindow(QMainWindow):
         self.safe_log(f"🔁 Gemini missed {len(missing_cues)} subtitle row(s). Translating missing rows only...")
         repaired_total = 0
         chunk_size = 15
+        total_chunks = max(1, (len(missing_cues) + chunk_size - 1) // chunk_size)
         tag_instruction = self._gemini_tag_format_instruction()
         for chunk_start in range(0, len(missing_cues), chunk_size):
             chunk = missing_cues[chunk_start:chunk_start + chunk_size]
             missing_srt = cues_to_numbered_srt(chunk)
             if not missing_srt.strip():
                 continue
+            chunk_number = (chunk_start // chunk_size) + 1
+            requested_numbers = {
+                self._cue_number(cue, chunk_start + index)
+                for index, cue in enumerate(chunk, start=1)
+            }
+            self.safe_log(
+                f"🔁 Repairing Khmer translation batch {chunk_number}/{total_chunks} "
+                f"({len(chunk)} row(s))..."
+            )
             prompt = (
                 "Translate ONLY these missing subtitle blocks into natural Khmer.\n"
                 "Return ONLY valid SRT. No Markdown, no notes, no explanation.\n"
@@ -10102,8 +10252,10 @@ class MainWindow(QMainWindow):
                     continue
                 for index, cue in enumerate(repaired_cues, start=1):
                     number = self._cue_number(cue, index)
+                    if number not in requested_numbers:
+                        continue
                     text = str(cue.get("text", "") or "").strip()
-                    if text:
+                    if text and not self._looks_untranslated_for_khmer_tts(text):
                         translated_by_number[number] = text
                         repaired_total += 1
             except Exception as e:
@@ -10577,6 +10729,7 @@ except Exception:
                 "khmer_font": DEFAULT_KHMER_FONT,
                 "voxcpm2_enabled": False,
                 "tts_engine_mode": "edge",
+                "edge_tts_workers": 2,
                 "voxcpm2_autostart": False,
                 "voxcpm2_stop_on_close": True,
                 "voxcpm2_voice_mode": "all",
@@ -10949,6 +11102,28 @@ except Exception:
 
         return None
 
+    def _release_cuda_memory(self, log_release: bool = False) -> None:
+        """Release unused PyTorch CUDA allocations after GPU-heavy work."""
+        try:
+            import gc
+
+            gc.collect()
+            torch_module = sys.modules.get("torch")
+            if torch_module is None or not torch_module.cuda.is_available():
+                return
+            reserved_before = int(torch_module.cuda.memory_reserved())
+            torch_module.cuda.empty_cache()
+            try:
+                torch_module.cuda.ipc_collect()
+            except Exception:
+                pass
+            reserved_after = int(torch_module.cuda.memory_reserved())
+            if log_release and reserved_before > 0:
+                released_mb = max(0, reserved_before - reserved_after) / (1024 * 1024)
+                self.log(f"🧹 Released {released_mb:.0f} MB of unused GPU memory.")
+        except Exception:
+            pass
+
     def _run_demucs_in_process(self, source_wav: str, separated_dir: str) -> bool:
         try:
             from demucs.separate import main as demucs_main  # type: ignore
@@ -11030,6 +11205,7 @@ except Exception:
                 pass
             demucs_audio.save_audio = original_audio_save
             demucs_separate.save_audio = original_separate_save
+            self._release_cuda_memory(log_release=True)
 
     def _run_process_for_demucs(self, cmd: list[str], step_name: str) -> bool:
         try:
@@ -11617,23 +11793,86 @@ except Exception:
 
     def select_ad_video(self) -> None:
         last_dir = self.app_settings.get("last_ad_video_dir") or self.app_settings.get("last_video_dir", "") # type: ignore
-        path, _ = QFileDialog.getOpenFileName(
+        paths, _ = QFileDialog.getOpenFileNames(
             self,
-            "Select Advertisement Video",
+            "Add Advertisement Videos",
             last_dir,
             "Video Files (*.mp4 *.avi *.mkv *.mov *.wmv *.flv *.webm *.m4v *.3gp *.ts *.mts *.m2ts *.vob)"
         )
-        if path:
-            if self.ad_video_path_input is not None:
-                self.ad_video_path_input.setText(path)
-            self.app_settings["ad_video_path"] = path
-            self.app_settings["last_ad_video_dir"] = os.path.dirname(path)
+        if paths:
+            combined = self.get_ad_video_paths()
+            combined.extend(paths)
+            self._set_ad_video_paths(combined)
+            self.app_settings["last_ad_video_dir"] = os.path.dirname(paths[-1])
             self.save_app_settings()
 
-    def clear_ad_video(self) -> None:
+    def _save_ad_video_position(self, *_args) -> None:
+        position = "end"
+        if self.ad_video_position_combo is not None:
+            position = str(self.ad_video_position_combo.currentData() or "end")
+        self.app_settings["ad_video_position"] = position if position in {"beginning", "middle", "end"} else "end"
+        self.save_app_settings()
+
+    def get_ad_video_position(self) -> str:
+        if self.ad_video_position_combo is not None:
+            position = str(self.ad_video_position_combo.currentData() or "end")
+        else:
+            position = str(self.app_settings.get("ad_video_position", "end") or "end")
+        return position if position in {"beginning", "middle", "end"} else "end"
+
+    def get_ad_video_paths(self) -> list[str]:
+        paths: list[str] = []
+        if self.ad_video_list is not None:
+            for index in range(self.ad_video_list.count()):
+                item = self.ad_video_list.item(index)
+                path = str(item.data(QT_USER_ROLE) or "").strip()
+                if path:
+                    paths.append(path)
+        elif self.ad_video_path_input is not None:
+            legacy_path = self.ad_video_path_input.text().strip()
+            if legacy_path:
+                paths.append(legacy_path)
+        return paths
+
+    def _set_ad_video_paths(self, paths: list[str], save: bool = True) -> None:
+        clean_paths: list[str] = []
+        seen: set[str] = set()
+        for raw_path in paths:
+            path = os.path.abspath(str(raw_path or "").strip())
+            key = os.path.normcase(path)
+            if path and key not in seen:
+                seen.add(key)
+                clean_paths.append(path)
+
+        if self.ad_video_list is not None:
+            self.ad_video_list.clear()
+            for path in clean_paths:
+                item = QListWidgetItem(os.path.basename(path))
+                item.setData(QT_USER_ROLE, path)
+                item.setToolTip(path)
+                if not os.path.exists(path):
+                    item.setForeground(QColor("#dc2626"))
+                self.ad_video_list.addItem(item)
         if self.ad_video_path_input is not None:
-            self.ad_video_path_input.clear()
-        self.app_settings["ad_video_path"] = ""
+            self.ad_video_path_input.setText(clean_paths[0] if clean_paths else "")
+
+        if save:
+            self.app_settings["ad_video_paths"] = clean_paths
+            self.app_settings["ad_video_path"] = clean_paths[0] if clean_paths else ""
+            self.app_settings["ad_video_shuffle_remaining"] = []
+            self.save_app_settings()
+
+    def remove_selected_ad_videos(self) -> None:
+        if self.ad_video_list is None:
+            return
+        selected_rows = sorted({self.ad_video_list.row(item) for item in self.ad_video_list.selectedItems()}, reverse=True)
+        for row in selected_rows:
+            self.ad_video_list.takeItem(row)
+        self._set_ad_video_paths(self.get_ad_video_paths())
+
+    def clear_ad_video(self) -> None:
+        self._set_ad_video_paths([])
+        self.app_settings["ad_video_last_selected"] = ""
         self.save_app_settings()
 
     def select_marquee_color(self) -> None:
@@ -11816,15 +12055,39 @@ except Exception:
             self.btn_marquee_preview.setText("Preview on Video")
 
     def get_ad_video_path(self) -> str:
-        path = ""
-        if self.ad_video_path_input is not None:
-            path = self.ad_video_path_input.text() if hasattr(self.ad_video_path_input, 'text') else str(self.ad_video_path_input)
-        path = path.strip()
-        if path:
-            self.app_settings["ad_video_path"] = path
-            self.app_settings["last_ad_video_dir"] = os.path.dirname(path)
-            self.save_app_settings()
-        return path
+        paths = self.get_ad_video_paths()
+        return paths[0] if paths else ""
+
+    def _next_ad_video_path(self) -> str:
+        paths = [path for path in self.get_ad_video_paths() if os.path.exists(path)]
+        if not paths:
+            return ""
+
+        valid_keys = {os.path.normcase(path): path for path in paths}
+        remaining = self.app_settings.get("ad_video_shuffle_remaining", [])
+        if not isinstance(remaining, list):
+            remaining = []
+        remaining = [valid_keys[os.path.normcase(path)] for path in remaining if os.path.normcase(path) in valid_keys]
+
+        last_selected = str(self.app_settings.get("ad_video_last_selected", "") or "")
+        if not remaining:
+            remaining = paths[:]
+            random.shuffle(remaining)
+            if len(remaining) > 1 and os.path.normcase(remaining[0]) == os.path.normcase(last_selected):
+                remaining[0], remaining[1] = remaining[1], remaining[0]
+
+        selected = remaining.pop(0)
+        self.app_settings["ad_video_paths"] = paths
+        self.app_settings["ad_video_path"] = paths[0]
+        self.app_settings["ad_video_shuffle_remaining"] = remaining
+        self.app_settings["ad_video_last_selected"] = selected
+        self.app_settings["last_ad_video_dir"] = os.path.dirname(selected)
+        self.save_app_settings()
+        self.log(
+            f"🎲 Advertisement rotation selected: {os.path.basename(selected)} "
+            f"({len(remaining)} remaining in this cycle)"
+        )
+        return selected
 
     def select_ffmpeg(self) -> None:
         last_dir = self.app_settings.get("last_ffmpeg_dir", "") # type: ignore
@@ -11931,6 +12194,7 @@ except Exception:
         if hasattr(self, 'progress'): # type: ignore
             self.progress.setValue(100)
         self.progress_text_signal.emit("")  # Clear progress text
+        self._release_cuda_memory(log_release=True)
     def update_progress_text(self, text: str) -> None:
         """Update progress bar text display (e.g., 'Encoding: 45%')"""
         if hasattr(self, 'export_progress'): # type: ignore
@@ -12074,6 +12338,25 @@ except Exception:
             return
         for row in range(self.segment_table.rowCount()):
             self._apply_action_engine_labels(self.segment_table.cellWidget(row, 5))
+        self._refresh_timeline_engine_actions()
+
+    def _refresh_timeline_engine_actions(self) -> None:
+        engine_mode = str(self.app_settings.get("tts_engine_mode", "edge") or "edge")
+        web_mode = engine_mode == "voxcpm2_web"
+        local_vox_mode = engine_mode == "voxcpm2"
+
+        if hasattr(self, "btn_voxcpm2_web_pack"):
+            self.btn_voxcpm2_web_pack.setVisible(web_mode)
+        if hasattr(self, "btn_import_vox_web_audio"):
+            self.btn_import_vox_web_audio.setVisible(web_mode)
+        if hasattr(self, "btn_timeline_audio"):
+            self.btn_timeline_audio.setVisible(not web_mode)
+            self.btn_timeline_audio.setText("Generate Vox Audio" if local_vox_mode else "Generate Selected Audio")
+            self.btn_timeline_audio.setToolTip(
+                "Generate VoxCPM2 audio for checked/selected subtitle rows."
+                if local_vox_mode
+                else "Generate Edge TTS audio for checked/selected subtitle rows."
+            )
 
     def _display_action_type(self, action_type: str) -> str:
         if self.app_settings.get("tts_engine_mode") == "voxcpm2_web":
@@ -12237,7 +12520,7 @@ except Exception:
 
     def _auto_fit_tempo_limits(self, auto_fit: bool) -> tuple[float, float]:
         min_tempo, max_tempo = self._voxcpm2_tempo_limits()
-        if auto_fit:
+        if auto_fit and self._voxcpm2_timing_mode() == "fit":
             max_tempo = max(max_tempo, STRICT_AUTO_FIT_TEMPO_MAX)
         return min_tempo, max_tempo
 
@@ -12623,7 +12906,9 @@ except Exception:
         self.save_app_settings()
         self.current_srt_path = srt_path
         self._loading_srt = True
-        self._clear_generated_audio_state()
+        # Preserve cached clips until the new table is populated. Compatible rows
+        # are retained below; clearing here made every SRT reload regenerate audio.
+        self.last_generated_audio = None
         self.log(f"Loaded SRT: {srt_path}")
     
         try:
@@ -12715,6 +13000,7 @@ except Exception:
                 self._populate_character_profiles_table(self.srt_characters)
         
             self.progress.setValue(100) # type: ignore
+            self._reconcile_generated_audio_cache_with_table()
             self._refresh_timeline()
             self._set_table_undo_baseline(clear_history=True)
 
@@ -13074,6 +13360,7 @@ except Exception:
             segments = adjusted_segments
         valid_segments = []
         skipped_count = 0
+        untranslated_count = 0
         for seg in segments:
             text = str(seg.get("text", "")).strip()
             start = int(seg.get("start", 0))
@@ -13081,9 +13368,24 @@ except Exception:
             if not text or end <= start:
                 skipped_count += 1
                 continue
+            if (
+                str(self.app_settings.get("tts_engine_mode", "edge") or "edge") == "edge"
+                and str(seg.get("voice", "") or "").startswith("km-KH-")
+                and self._looks_untranslated_for_khmer_tts(text)
+            ):
+                row = seg.get("_row")
+                if row is not None:
+                    self.audio_status_signal.emit(int(row), "Needs Khmer", "warning")
+                untranslated_count += 1
+                continue
             valid_segments.append(seg)
         if skipped_count:
             self.log(f"⚠️ Skipped {skipped_count} empty or invalid-timing subtitle rows.")
+        if untranslated_count:
+            self.log(
+                f"⚠️ Skipped {untranslated_count} row(s) that still look untranslated. "
+                "Click Smart Translate/Translate Khmer first, then Generate Audio again."
+            )
         return self._filter_tts_scope_segments(valid_segments)
 
     def _refresh_tts_scope_roles(self) -> None:
@@ -13123,16 +13425,27 @@ except Exception:
         }.get(engine_mode, "Standard Edge TTS")
         self.log(f"🔊 TTS engine: {label}")
 
+    def _on_tts_workers_changed(self, value: int) -> None:
+        worker_count = max(1, min(6, int(value)))
+        self.app_settings["edge_tts_workers"] = worker_count
+        self.save_app_settings()
+        self.log(f"🔧 Standard Edge TTS workers: {worker_count}")
+
     def _sync_home_voxcpm2_controls(self) -> None:
         if not hasattr(self, "home_voxcpm2_frame"):
             return
         engine_mode = str(self.app_settings.get("tts_engine_mode", "voxcpm2" if self.app_settings.get("voxcpm2_enabled", False) else "edge") or "edge")
         use_voxcpm2 = engine_mode == "voxcpm2"
+        use_edge = engine_mode == "edge"
         if hasattr(self, "home_tts_engine_combo"):
             self.home_tts_engine_combo.blockSignals(True)
             index = self.home_tts_engine_combo.findData(engine_mode)
             self.home_tts_engine_combo.setCurrentIndex(max(0, index))
             self.home_tts_engine_combo.blockSignals(False)
+        if hasattr(self, "tts_workers_label"):
+            self.tts_workers_label.setEnabled(use_edge)
+        if hasattr(self, "tts_workers_spin"):
+            self.tts_workers_spin.setEnabled(use_edge)
         self.home_voxcpm2_frame.setVisible(use_voxcpm2)
         if hasattr(self, "home_voxcpm2_voice_mode_combo"):
             mode = self.app_settings.get("voxcpm2_voice_mode", "all")
@@ -13602,8 +13915,9 @@ except Exception:
                 self.log(f"⚠️ {len(failures)} VoxCPM2 row(s) failed and will be left silent: {failed_names}{more}")
             return
         else:
-            max_concurrent = 2 if len(tasks) >= 2 else 1
-            engine_name = "Edge TTS 2-worker mode" if max_concurrent == 2 else "Edge TTS single-line mode"
+            configured_workers = max(1, min(6, coerce_int(self.app_settings.get("edge_tts_workers"), 2)))
+            max_concurrent = max(1, min(len(tasks), configured_workers))
+            engine_name = f"Edge TTS {max_concurrent}-worker mode" if max_concurrent > 1 else "Edge TTS single-line mode"
         semaphore = asyncio.Semaphore(max_concurrent)
         failures = []
         total_tasks = len(tasks)
@@ -13723,11 +14037,60 @@ except Exception:
                         self.log(f"❌ Error gen {filename}: {e}")
                     failures.append((filename, str(e)))
 
-        await asyncio.gather(*(worker(t) for t in tasks))
+        # Edge's public service starts returning empty audio when a long batch sends
+        # too many requests continuously. Process bounded waves and give the service
+        # a short recovery window without reducing the configured worker count.
+        wave_size = max(max_concurrent, max_concurrent * 10)
+        for wave_start in range(0, len(tasks), wave_size):
+            if self.stop_event.is_set():
+                break
+            wave = tasks[wave_start:wave_start + wave_size]
+            await asyncio.gather(*(worker(task) for task in wave))
+            completed_wave_end = wave_start + len(wave)
+            if completed_wave_end < len(tasks) and not self.stop_event.is_set():
+                cooldown = random.uniform(6.0, 9.0)
+                self.log(
+                    f"⏸️ Edge TTS batch pacing: {completed_wave_end}/{len(tasks)} submitted; "
+                    f"cooling down for {cooldown:.1f}s."
+                )
+                await self._cancellable_tts_sleep(cooldown)
         if failures:
             failed_names = ", ".join(os.path.basename(filename) for filename, _error in failures[:5])
             more = f" and {len(failures) - 5} more" if len(failures) > 5 else ""
-            self.log(f"⚠️ {len(failures)} TTS segment(s) failed and will be left silent: {failed_names}{more}")
+            self.log(f"⚠️ {len(failures)} TTS segment(s) failed in the first pass and are queued for recovery: {failed_names}{more}")
+
+    async def _retry_missing_edge_tts_tasks(self, tasks: list[tuple]) -> None:
+        """Recover rate-limited Edge rows serially while keeping successful files."""
+        missing = [
+            task for task in tasks
+            if not os.path.exists(str(task[2])) or os.path.getsize(str(task[2])) < 100
+        ]
+        if not missing or self.app_settings.get("voxcpm2_enabled", False):
+            return
+
+        cooldown = 20.0
+        self.log(
+            f"🛟 Edge TTS recovery: {len(missing)} row(s) missing. "
+            f"Cooling down {cooldown:.0f}s, then retrying only missing rows with 1 worker."
+        )
+        await self._cancellable_tts_sleep(cooldown)
+        recovered = 0
+        for index, task in enumerate(missing, start=1):
+            if self.stop_event.is_set():
+                break
+            text, voice, filename, rate, pitch, role = task[:6]
+            try:
+                await self.tts_save(text, voice, filename, rate, pitch, role)
+                if os.path.exists(filename) and os.path.getsize(filename) >= 100:
+                    recovered += 1
+                    self.log(f"✅ Edge recovery {index}/{len(missing)} ready")
+                else:
+                    self.log(f"⚠️ Edge recovery {index}/{len(missing)} returned no audio")
+            except Exception as exc:
+                self.log(f"⚠️ Edge recovery {index}/{len(missing)} failed: {self._short_edge_tts_error(exc)}")
+            if index < len(missing) and not self.stop_event.is_set():
+                await self._cancellable_tts_sleep(random.uniform(1.5, 2.5))
+        self.log(f"🛟 Edge TTS recovery completed: {recovered}/{len(missing)} row(s) recovered.")
 
     def safe_load_audio(self, filepath: str, ffmpeg_bin: str) -> AudioSegment: # type: ignore
         """
@@ -13995,6 +14358,9 @@ except Exception:
             else:
                 self.log(f"🚀 Generating {len(tasks)} TTS segment(s)...") # type: ignore
             self.run_async_in_thread(self.batch_generate_tts(tasks))
+
+            if not self.stop_event.is_set() and not self.app_settings.get("voxcpm2_enabled", False):
+                self.run_async_in_thread(self._retry_missing_edge_tts_tasks(tasks))
         
             if self.stop_event.is_set():
                 self.log("🛑 Process stopped by user.")
@@ -15171,8 +15537,8 @@ except Exception:
             return ""
         expected_start = int(segment.get("start", 0) or 0)
         expected_end = int(segment.get("end", 0) or 0)
-        cached_start = int(audio_info.get("start", -1) or -1)
-        cached_end = int(audio_info.get("end", -1) or -1)
+        cached_start = coerce_int(audio_info.get("start"), -1)
+        cached_end = coerce_int(audio_info.get("end"), -1)
         if cached_start != expected_start or cached_end < expected_end - 100:
             return ""
         cached_text = str(audio_info.get("text", ""))
@@ -15239,6 +15605,7 @@ except Exception:
                         max_tempo=max_tempo,
                         target_rate=target_rate,
                         tail_allowance_ms=120,
+                        allow_trim=self._voxcpm2_timing_mode() == "fit",
                     )
                     fitted_count += int(fitted)
                     clipped_count += int(clipped)
@@ -15275,6 +15642,22 @@ except Exception:
         parts.append(f"atempo={tempo:.6f}")
         return ",".join(parts)
 
+    def _ffmpeg_has_video_encoder(self, ffmpeg_bin: str, encoder: str) -> bool:
+        try:
+            result = subprocess.run(
+                [ffmpeg_bin, "-hide_banner", "-encoders"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=15,
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+            )
+            return result.returncode == 0 and encoder in result.stdout
+        except Exception:
+            return False
+
     def _fit_audio_clip_to_available_ms(
         self,
         clip_path: str,
@@ -15285,8 +15668,9 @@ except Exception:
         max_tempo: float,
         target_rate: int,
         tail_allowance_ms: int = 0,
+        allow_trim: bool = True,
     ) -> tuple[AudioSegment, bool, bool]:
-        """Keep a generated clip inside its row so it cannot overlap the next row."""
+        """Fit a clip to its row, trimming only when the selected timing mode permits it."""
         available_ms = max(80, int(available_ms))
         trim_limit_ms = available_ms + max(0, int(tail_allowance_ms))
         fitted = False
@@ -15311,7 +15695,7 @@ except Exception:
                     if clip.frame_rate != target_rate:
                         clip = clip.set_frame_rate(target_rate)
                     fitted = True
-        if len(clip) > trim_limit_ms:
+        if allow_trim and len(clip) > trim_limit_ms:
             fade_ms = min(60, max(15, trim_limit_ms // 5))
             clip = clip[:trim_limit_ms].fade_out(fade_ms)
             clipped = True
@@ -15323,6 +15707,7 @@ except Exception:
         segments: list[dict[str, Any]],
         ffmpeg_bin: str,
         temp_files: list[str],
+        use_gpu: bool = False,
     ) -> Optional[tuple[str, str]]:
         """Create temp video/audio where short dialogue sections are slowed for natural Khmer speech."""
         if not self._segments_have_generated_clips(segments):
@@ -15422,24 +15807,82 @@ except Exception:
             concat_filter += "[aout]"
         fc.append(concat_filter)
 
-        cmd = [ffmpeg_bin, "-y", "-i", video_path, "-filter_complex", ";".join(fc), "-map", "[vout]"]
-        if has_audio:
-            cmd.extend(["-map", "[aout]", "-c:a", "aac", "-b:a", "192k"])
-        else:
-            cmd.extend(["-an"])
-        cmd.extend(["-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p", adjusted_video])
-        result = subprocess.run(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+        filter_script = os.path.join(
+            tempfile.gettempdir(),
+            f"srt_drama_natural_timing_{time.time_ns()}.ffgraph",
         )
+        with open(filter_script, "w", encoding="utf-8", newline="\n") as script_file:
+            script_file.write(";".join(fc))
+        temp_files.append(filter_script)
+
+        cmd_base = [
+            ffmpeg_bin, "-y", "-loglevel", "error", "-i", video_path,
+            "-filter_complex_script", filter_script, "-map", "[vout]",
+        ]
+        if has_audio:
+            cmd_base.extend(["-map", "[aout]", "-c:a", "aac", "-b:a", "192k"])
+        else:
+            cmd_base.extend(["-an"])
+
+        gpu_requested = bool(use_gpu)
+        nvenc_available = gpu_requested and self._is_nvidia_gpu_available() and self._ffmpeg_has_video_encoder(ffmpeg_bin, "h264_nvenc")
+        if nvenc_available:
+            self.log("🚀 Khmer Natural Timing: encoding adjusted video with NVIDIA GPU (H.264 NVENC).")
+            video_args = [
+                "-c:v", "h264_nvenc", "-preset", "p3", "-tune", "hq",
+                "-rc", "vbr", "-cq", "18", "-b:v", "0", "-pix_fmt", "yuv420p",
+            ]
+        else:
+            if gpu_requested:
+                self.log("⚠️ Khmer Natural Timing: NVENC is unavailable; using CPU x264 fallback.")
+            video_args = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p"]
+
+        def run_timing_encode(args: list[str]) -> subprocess.CompletedProcess:
+            command = [*cmd_base, *args, "-progress", "pipe:1", "-nostats", adjusted_video]
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+            )
+            expected_output_us = max(1, int(max(out_cursor, video_duration) * 1000))
+            if process.stdout:
+                for raw_line in process.stdout:
+                    if self.stop_event.is_set():
+                        process.terminate()
+                        break
+                    key, separator, raw_value = raw_line.strip().partition("=")
+                    if separator and key in {"out_time_us", "out_time_ms"}:
+                        try:
+                            encoded_us = max(0, int(raw_value))
+                            percent = max(0, min(99, int(encoded_us * 100 / expected_output_us)))
+                            self.progress_text_signal.emit(f"Render 1/2: Natural Timing encode {percent}%")
+                            self.progress_signal.emit(5 + int(percent * 0.4))
+                        except (TypeError, ValueError):
+                            pass
+            process.wait()
+            stderr_text = process.stderr.read() if process.stderr else ""
+            return subprocess.CompletedProcess(command, process.returncode, "", stderr_text)
+
+        result = run_timing_encode(video_args)
+        if result.returncode != 0 and nvenc_available:
+            self.log("⚠️ Khmer Natural Timing: NVENC failed; retrying safely with CPU x264.")
+            try:
+                if os.path.exists(adjusted_video):
+                    os.remove(adjusted_video)
+            except OSError:
+                pass
+            result = run_timing_encode(
+                ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p"]
+            )
         if result.returncode != 0 or not os.path.exists(adjusted_video):
             self.log(f"⚠️ Khmer Natural Timing video adjustment failed. Rendering normally. Error: {result.stderr[-500:]}")
             return None
+        self.log("✅ Khmer Natural Timing adjusted video encoded. Assembling dialogue audio...")
+        self.progress_text_signal.emit("Render 1/2: assembling timed dialogue audio")
 
         target_rate = 44100
         total_audio_ms = int(max(out_cursor, video_duration)) + 3000
@@ -15463,7 +15906,20 @@ except Exception:
             clip_path = self._generated_clip_path_for_segment(segment)
             if not clip_path:
                 continue
-            clip = self.safe_load_audio(clip_path, ffmpeg_bin)
+            try:
+                clip = self.safe_load_audio(clip_path, ffmpeg_bin)
+            except Exception as exc:
+                self.log(f"⚠️ Row {row + 1} cached audio is unreadable and will be regenerated: {exc}")
+                bad_info = self.generated_audio_segments.pop(row, None)
+                try:
+                    bad_path = str((bad_info or {}).get("path", "") or "")
+                    if bad_path and os.path.exists(bad_path):
+                        os.remove(bad_path)
+                except OSError:
+                    pass
+                self._save_generated_audio_cache()
+                self.audio_status_signal.emit(row, "Retry", "warning")
+                return None
             if clip.frame_rate != target_rate:
                 clip = clip.set_frame_rate(target_rate)
             start_ms = start_positions[row]
@@ -15480,10 +15936,17 @@ except Exception:
                 max_tempo=max_final_audio_tempo,
                 target_rate=target_rate,
                 tail_allowance_ms=180,
+                allow_trim=self._voxcpm2_timing_mode() == "fit",
             )
             fitted_count += int(fitted)
             clipped_count += int(clipped)
             final_audio = final_audio.overlay(clip, position=start_ms)
+            completed = index + 1
+            if completed == len(render_rows) or completed % 10 == 0:
+                self.progress_text_signal.emit(
+                    f"Render 1/2: assembling dialogue {completed}/{len(render_rows)}"
+                )
+                self.progress_signal.emit(45 + int(completed / max(1, len(render_rows)) * 20))
         if fitted_count or clipped_count:
             self.log(f"🔧 Prevented dub overlap: fitted {fitted_count} clip(s), trimmed {clipped_count} clip(s).")
         final_audio.export(adjusted_audio, format="wav")
@@ -15493,11 +15956,14 @@ except Exception:
         # Temp audio path
         temp_audio = os.path.join(tempfile.gettempdir(), f"srt_drama_auto_export_{time.time_ns()}.wav")
         temp_render_files = [temp_audio]
+        natural_timing_use_gpu = bool(video_settings.get("use_gpu", self.app_settings.get("use_gpu", False)))
 
         if self._segments_have_generated_clips(segments):
             self.log("🔄 Step 1/2: Balancing generated audio with local video slow-down for render...")
             self.progress_text_signal.emit("Render 1/2: assembling generated audio")
-            natural_media = self._build_khmer_natural_timing_media(video_path, segments, ffmpeg_bin, temp_render_files)
+            natural_media = self._build_khmer_natural_timing_media(
+                video_path, segments, ffmpeg_bin, temp_render_files, use_gpu=natural_timing_use_gpu
+            )
             if natural_media:
                 video_path, temp_audio = natural_media
                 assembled = True
@@ -15531,32 +15997,55 @@ except Exception:
                                     emit_signal=False,
                                     individual_clips=True) # type: ignore
             if self._segments_have_generated_clips(segments):
-                natural_media = self._build_khmer_natural_timing_media(video_path, segments, ffmpeg_bin, temp_render_files)
+                natural_media = self._build_khmer_natural_timing_media(
+                    video_path, segments, ffmpeg_bin, temp_render_files, use_gpu=natural_timing_use_gpu
+                )
                 if natural_media:
                     video_path, temp_audio = natural_media
                 else:
                     self._assemble_generated_clips_audio(segments, temp_audio, ffmpeg_bin)
 
         if not os.path.exists(temp_audio):
-            self.log("🔄 Step 1/2: Auto-generating natural audio clips (SRT to WAV)...")
-            self.progress_text_signal.emit("Render 1/2: generating audio")
-            natural_timing_fit_audio = False
-            # Fix Bug #11: Disable signal emission during auto-export to prevent premature UI re-enable
-            self.run_srt_thread(segments, ffmpeg_bin, temp_audio, quality_idx=0,
-                                auto_fit=natural_timing_fit_audio,
-                                fade_in=audio_settings['fade_in'],
-                                fade_out=audio_settings['fade_out'],
-                                auto_play=False, # type: ignore
-                                emit_signal=False,
-                                individual_clips=True) # type: ignore
-            natural_media = self._build_khmer_natural_timing_media(video_path, segments, ffmpeg_bin, temp_render_files)
-            if natural_media:
-                video_path, temp_audio = natural_media
-            elif self._segments_have_generated_clips(segments):
-                self._assemble_generated_clips_audio(segments, temp_audio, ffmpeg_bin)
+            remaining_segments = [
+                segment for segment in segments
+                if not self._generated_clip_path_for_segment(segment)
+            ]
+            if remaining_segments:
+                self.log(f"🔄 Final Edge recovery pass: generating only {len(remaining_segments)} missing row(s)...")
+                self.progress_text_signal.emit("Render 1/2: recovering missing audio")
+                self.run_srt_thread(
+                    remaining_segments,
+                    ffmpeg_bin,
+                    temp_audio,
+                    quality_idx=0,
+                    auto_fit=bool(audio_settings.get('auto_fit', True)),
+                    fade_in=audio_settings['fade_in'],
+                    fade_out=audio_settings['fade_out'],
+                    auto_play=False,
+                    emit_signal=False,
+                    individual_clips=True,
+                )
+            if self._segments_have_generated_clips(segments):
+                natural_media = self._build_khmer_natural_timing_media(
+                    video_path, segments, ffmpeg_bin, temp_render_files, use_gpu=natural_timing_use_gpu
+                )
+                if natural_media:
+                    video_path, temp_audio = natural_media
+                else:
+                    self._assemble_generated_clips_audio(segments, temp_audio, ffmpeg_bin)
                     
         if not os.path.exists(temp_audio):
-            self.log("❌ Auto-generation failed. Stopping export.")
+            missing_rows = [
+                int(segment.get("_row", index)) + 1
+                for index, segment in enumerate(segments)
+                if not self._generated_clip_path_for_segment(segment)
+            ]
+            row_preview = ", ".join(str(row) for row in missing_rows[:12])
+            more = f" and {len(missing_rows) - 12} more" if len(missing_rows) > 12 else ""
+            self.log(
+                f"❌ Auto-generation stopped because {len(missing_rows)} row(s) still have no audio: "
+                f"{row_preview}{more}. Successful cached rows were kept."
+            )
             self.srt_finished_signal.emit()
             self.export_finished_signal.emit()
             return
@@ -15608,15 +16097,92 @@ except Exception:
         markers = ("_dubbed", "preview_video", "final_video_export", "_srt_drama_main")
         return any(marker in name for marker in markers)
 
-    def append_ad_video_to_export(self, main_video_path: str, ad_video_path: str, output_path: str) -> tuple[bool, str]:
+    def append_ad_video_to_export(
+        self,
+        main_video_path: str,
+        ad_video_path: str,
+        output_path: str,
+        position: str = "end",
+    ) -> tuple[bool, str]:
         if not ad_video_path or not os.path.exists(ad_video_path):
             return False, "Advertisement video file was not found."
         if self._paths_same_file(main_video_path, ad_video_path):
             return False, "Advertisement video cannot be the same file as the exported video."
 
-        self.log(f"🔗 Appending advertisement video: {os.path.basename(ad_video_path)}")
-        self.progress_text_signal.emit("Appending advertisement video...")
-        return self.concat_project_videos([main_video_path, ad_video_path], output_path, force_reencode=True)
+        position = position if position in {"beginning", "middle", "end"} else "end"
+        position_label = {"beginning": "beginning", "middle": "middle", "end": "end"}[position]
+        self.log(f"🔗 Inserting advertisement at the {position_label}: {os.path.basename(ad_video_path)}")
+        self.progress_text_signal.emit(f"Inserting advertisement at the {position_label}...")
+
+        if position == "beginning":
+            return self.concat_project_videos([ad_video_path, main_video_path], output_path, force_reencode=True)
+        if position == "end":
+            return self.concat_project_videos([main_video_path, ad_video_path], output_path, force_reencode=True)
+
+        duration_ms = self.get_video_duration_ms(main_video_path)
+        if duration_ms < 2000:
+            return False, "Main video is too short for a middle advertisement."
+
+        ffmpeg_bin = self.get_ffmpeg()
+        midpoint_seconds = duration_ms / 2000.0
+        main_duration_seconds = duration_ms / 1000.0
+        ad_duration_seconds = max(0.1, self.get_video_duration_ms(ad_video_path) / 1000.0)
+        target_width, target_height = self.get_video_dimensions(main_video_path)
+        if target_width <= 0 or target_height <= 0:
+            return False, "Could not read main video dimensions for middle advertisement."
+
+        normalize_video = (
+            f"scale={target_width}:{target_height}:force_original_aspect_ratio=decrease,"
+            f"pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2:black,"
+            "setsar=1,fps=30,format=yuv420p"
+        )
+        filters = [
+            "[0:v:0]split=2[mainvpre][mainvpost]",
+            f"[mainvpre]trim=start=0:end={midpoint_seconds:.3f},setpts=PTS-STARTPTS,{normalize_video}[v0]",
+            f"[1:v:0]{normalize_video},setpts=PTS-STARTPTS[v1]",
+            f"[mainvpost]trim=start={midpoint_seconds:.3f}:end={main_duration_seconds:.3f},"
+            f"setpts=PTS-STARTPTS,{normalize_video}[v2]",
+        ]
+        if self.has_audio_stream(main_video_path):
+            filters.extend([
+                "[0:a:0]asplit=2[mainapre][mainapost]",
+                f"[mainapre]atrim=start=0:end={midpoint_seconds:.3f},asetpts=PTS-STARTPTS,"
+                "aformat=sample_rates=48000:channel_layouts=stereo[a0]",
+                f"[mainapost]atrim=start={midpoint_seconds:.3f}:end={main_duration_seconds:.3f},"
+                "asetpts=PTS-STARTPTS,aformat=sample_rates=48000:channel_layouts=stereo[a2]",
+            ])
+        else:
+            filters.extend([
+                f"anullsrc=r=48000:cl=stereo:d={midpoint_seconds:.3f}[a0]",
+                f"anullsrc=r=48000:cl=stereo:d={main_duration_seconds - midpoint_seconds:.3f}[a2]",
+            ])
+        if self.has_audio_stream(ad_video_path):
+            filters.append(
+                "[1:a:0]aformat=sample_rates=48000:channel_layouts=stereo,asetpts=PTS-STARTPTS[a1]"
+            )
+        else:
+            filters.append(f"anullsrc=r=48000:cl=stereo:d={ad_duration_seconds:.3f}[a1]")
+        filters.append("[v0][a0][v1][a1][v2][a2]concat=n=3:v=1:a=1[outv][outa]")
+
+        command = [
+            ffmpeg_bin, "-y", "-i", main_video_path, "-i", ad_video_path,
+            "-filter_complex", ";".join(filters),
+            "-map", "[outv]", "-map", "[outa]",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+            "-c:a", "aac", "-b:a", "192k", output_path,
+        ]
+        result = subprocess.run(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+        )
+        if result.returncode == 0 and os.path.exists(output_path):
+            return True, ""
+        return False, f"Could not insert middle advertisement: {result.stderr[-700:]}"
 
     def _ffmpeg_filter_path(self, path: str) -> str:
         normalized = os.path.abspath(path).replace("\\", "/")
@@ -15869,7 +16435,8 @@ except Exception:
             "use_gpu": self.chk_gpu.isChecked(),
             "remove_vocals": self.chk_remove_vocals.isChecked(),
             "enable_lip_sync": self.chk_lip_sync.isChecked() if hasattr(self, 'chk_lip_sync') else False,
-            "ad_video_path": "" if preview else self.get_ad_video_path(),
+            "ad_video_path": "" if preview else self._next_ad_video_path(),
+            "ad_video_position": self.get_ad_video_position(),
             "cut_enabled": self.chk_cut.isChecked(),
             "cut_start": self.txt_start.text(), # type: ignore
             "cut_end": self.txt_end.text()
@@ -15942,6 +16509,7 @@ except Exception:
             output_file = self._non_conflicting_output_path(output_file, video_path)
             final_output_file = output_file
             ad_video_path = str(s.get("ad_video_path", "") or "").strip()
+            ad_video_position = str(s.get("ad_video_position", "end") or "end")
             append_ad_video = bool(ad_video_path and not s.get('preview', False))
             if append_ad_video and not os.path.exists(ad_video_path):
                 self.log(f"⚠️ Advertisement video not found, exporting without it: {ad_video_path}")
@@ -16215,7 +16783,9 @@ except Exception:
                     self.log("⚠️ Lip-Sync failed, using original video")
 
             if append_ad_video:
-                success, error_msg = self.append_ad_video_to_export(output_file, ad_video_path, final_output_file)
+                success, error_msg = self.append_ad_video_to_export(
+                    output_file, ad_video_path, final_output_file, position=ad_video_position
+                )
                 if success and os.path.exists(final_output_file):
                     output_file = final_output_file
                     self.log(f"✅ Advertisement video appended. Final output: {output_file}")
@@ -16628,6 +17198,7 @@ except Exception:
         self.app_settings.setdefault("update_url", DEFAULT_UPDATE_URL)
         self.app_settings["voxcpm2_enabled"] = False
         self.app_settings["tts_engine_mode"] = "edge"
+        self.app_settings.setdefault("edge_tts_workers", 2)
         self.app_settings.setdefault("voxcpm2_autostart", False)
         self.app_settings.setdefault("voxcpm2_stop_on_close", True)
         self.app_settings.setdefault("voxcpm2_voice_mode", "all")
@@ -16659,6 +17230,10 @@ except Exception:
         self.app_settings.setdefault("marquee_speed", 160)
         self.app_settings.setdefault("marquee_font_size", 42)
         self.app_settings.setdefault("marquee_color", "white")
+        self.app_settings.setdefault("ad_video_paths", [])
+        self.app_settings.setdefault("ad_video_shuffle_remaining", [])
+        self.app_settings.setdefault("ad_video_last_selected", "")
+        self.app_settings.setdefault("ad_video_position", "end")
         self.app_settings.setdefault("crop_zoom_percent", 100)
         self.app_settings.setdefault("crop_values", [0, 0, 0, 0])
         self.app_settings.setdefault("voxcpm2_url", DEFAULT_VOXCPM2_URL)
@@ -16796,7 +17371,11 @@ except Exception:
         if hasattr(self, 'chk_lip_sync'):
             self.app_settings["enable_lip_sync"] = self.chk_lip_sync.isChecked()
         if hasattr(self, 'ad_video_path_input') and self.ad_video_path_input is not None:
-            self.app_settings["ad_video_path"] = self.ad_video_path_input.text().strip()
+            ad_video_paths = self.get_ad_video_paths()
+            self.app_settings["ad_video_paths"] = ad_video_paths
+            self.app_settings["ad_video_path"] = ad_video_paths[0] if ad_video_paths else ""
+        if self.ad_video_position_combo is not None:
+            self.app_settings["ad_video_position"] = self.get_ad_video_position()
         if self.chk_marquee_text is not None:
             self.app_settings["marquee_enabled"] = self.chk_marquee_text.isChecked()
         if self.txt_marquee_text is not None:
@@ -17014,25 +17593,37 @@ except Exception:
             if target_width > 0 and target_height > 0:
                 video_filters = []
                 input_streams = []
-                for idx in range(len(video_paths)):
-                    video_filters.append(
+                for idx, path in enumerate(video_paths):
+                    stream_filter = (
                         f"[{idx}:v:0]scale={target_width}:{target_height}:force_original_aspect_ratio=decrease,"
                         f"pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2:black,"
                         f"setsar=1,fps=30,format=yuv420p,setpts=PTS-STARTPTS[v{idx}];"
-                        f"[{idx}:a:0]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
-                        f"asetpts=PTS-STARTPTS[a{idx}]"
                     )
+                    if self.has_audio_stream(path):
+                        stream_filter += (
+                            f"[{idx}:a:0]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
+                            f"asetpts=PTS-STARTPTS[a{idx}]"
+                        )
+                    else:
+                        duration_seconds = max(0.1, self.get_video_duration_ms(path) / 1000.0)
+                        stream_filter += f"anullsrc=r=48000:cl=stereo:d={duration_seconds:.3f}[a{idx}]"
+                    video_filters.append(stream_filter)
                     input_streams.append(f"[v{idx}][a{idx}]")
                 filter_complex = ";".join(video_filters + [f"{''.join(input_streams)}concat=n={len(video_paths)}:v=1:a=1[outv][outa]"])
             else:
                 video_filters = []
                 input_streams = []
-                for idx in range(len(video_paths)):
-                    video_filters.append(
-                        f"[{idx}:v:0]setsar=1,fps=30,format=yuv420p,setpts=PTS-STARTPTS[v{idx}];"
-                        f"[{idx}:a:0]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
-                        f"asetpts=PTS-STARTPTS[a{idx}]"
-                    )
+                for idx, path in enumerate(video_paths):
+                    stream_filter = f"[{idx}:v:0]setsar=1,fps=30,format=yuv420p,setpts=PTS-STARTPTS[v{idx}];"
+                    if self.has_audio_stream(path):
+                        stream_filter += (
+                            f"[{idx}:a:0]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
+                            f"asetpts=PTS-STARTPTS[a{idx}]"
+                        )
+                    else:
+                        duration_seconds = max(0.1, self.get_video_duration_ms(path) / 1000.0)
+                        stream_filter += f"anullsrc=r=48000:cl=stereo:d={duration_seconds:.3f}[a{idx}]"
+                    video_filters.append(stream_filter)
                     input_streams.append(f"[v{idx}][a{idx}]")
                 filter_complex = ";".join(video_filters + [f"{''.join(input_streams)}concat=n={len(video_paths)}:v=1:a=1[outv][outa]"])
             cmd.extend([
@@ -17497,6 +18088,8 @@ except Exception:
             "contrast": self.sb_contrast.value(),
             "saturation": self.sb_saturation.value(),
             "ad_video_path": self.get_ad_video_path(),
+            "ad_video_paths": self.get_ad_video_paths(),
+            "ad_video_position": self.get_ad_video_position(),
             "thought_reverb_enabled": self._thought_reverb_enabled(),
             "thought_reverb_strength": self._thought_reverb_strength(),
             "marquee_enabled": self.chk_marquee_text.isChecked() if self.chk_marquee_text is not None else False,
@@ -17615,10 +18208,17 @@ except Exception:
         self.sb_brightness.setValue(float_setting(settings.get("brightness"), 0.0))
         self.sb_contrast.setValue(float_setting(settings.get("contrast"), 1.0))
         self.sb_saturation.setValue(float_setting(settings.get("saturation"), 1.0))
+        ad_video_paths = settings.get("ad_video_paths", [])
+        if not isinstance(ad_video_paths, list):
+            ad_video_paths = []
         ad_video_path = str(settings.get("ad_video_path", "") or "")
-        if self.ad_video_path_input is not None:
-            self.ad_video_path_input.setText(ad_video_path)
-        self.app_settings["ad_video_path"] = ad_video_path
+        if ad_video_path and ad_video_path not in ad_video_paths:
+            ad_video_paths.append(ad_video_path)
+        self._set_ad_video_paths(ad_video_paths)
+        ad_video_position = str(settings.get("ad_video_position", "end") or "end")
+        if self.ad_video_position_combo is not None:
+            position_index = self.ad_video_position_combo.findData(ad_video_position)
+            self.ad_video_position_combo.setCurrentIndex(position_index if position_index >= 0 else 2)
         if self.chk_marquee_text is not None:
             self.chk_marquee_text.setChecked(bool(settings.get("marquee_enabled", False)))
         if self.txt_marquee_text is not None:
@@ -17714,6 +18314,7 @@ except Exception:
 
         self._suspend_undo_capture = False
         self.btn_run_srt.setEnabled(True)
+        self._reconcile_generated_audio_cache_with_table()
         self._refresh_timeline()
         self._set_table_undo_baseline(clear_history=True)
         self.log(f"✅ Project loaded with {len(segments)} segments.")

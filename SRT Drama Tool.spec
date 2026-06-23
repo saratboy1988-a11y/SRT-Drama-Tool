@@ -82,6 +82,8 @@ a = Analysis(
         'tkinter',
         'PyQt5.QtTest',
         'cryptography',
+        'tensorboard',
+        'torch.utils.tensorboard',
         # Do NOT exclude asyncio - it's needed and will be auto-included
     ],
     noarchive=False,

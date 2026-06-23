@@ -31,5 +31,10 @@
   "update_url": "https://github.com/saratboy1988-a11y/SRT-Drama-Tool/releases/latest",
   "dub_audio_lead_ms": 0,
   "tts_engine_mode": "edge",
-  "voxcpm2_enabled": false
+  "edge_tts_workers": 2,
+  "voxcpm2_enabled": false,
+  "ad_video_paths": [],
+  "ad_video_shuffle_remaining": [],
+  "ad_video_last_selected": "",
+  "ad_video_position": "end"
 }

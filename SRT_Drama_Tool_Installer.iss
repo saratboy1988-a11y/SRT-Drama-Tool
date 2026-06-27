@@ -5,7 +5,7 @@
 ; ============================================================================
 
 #define MyAppName "SRT Drama Tool"
-#define MyAppVersion "1.1.4"
+#define MyAppVersion "1.1.5"
 #define MyAppPublisher "Nou Sarat"
 #define MyAppURL "https://github.com/saratboy1988-a11y/SRT-Drama-Tool/releases/latest"
 #define MyAppExeName "SRT Drama Tool.exe"
@@ -20,11 +20,11 @@ AppPublisher={#MyAppPublisher}
 AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}
 AppUpdatesURL={#MyAppURL}
-VersionInfoVersion=1.1.4.0
+VersionInfoVersion=1.1.5.0
 VersionInfoCopyright=Copyright (c) 2024-2026 {#MyAppPublisher}
 VersionInfoDescription=Professional SRT Subtitle and Voice Tool with AI RVC
 VersionInfoProductName={#MyAppName}
-VersionInfoProductVersion=1.1.4
+VersionInfoProductVersion=1.1.5
 
 DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
@@ -33,9 +33,13 @@ OutputDir=installer_output
 OutputBaseFilename=SRT_Drama_Tool_v{#MyAppVersion}_Setup
 UninstallDisplayIcon={app}\{#MyAppExeName}
 
-Compression=lzma2/normal
+; PyTorch/CUDA ships several already-compressed multi-hundred-MB DLLs.
+; Recompressing them can make ISCC appear stuck for hours with little size gain.
+Compression=none
 SolidCompression=no
 CompressionThreads=auto
+DiskSpanning=yes
+DiskSliceSize=max
 
 WizardStyle=modern
 WizardSizePercent=100,100

@@ -58,13 +58,19 @@ def get_pytorch_status() -> dict:
 import json
 try:
     import torch
+    try:
+        import demucs
+        demucs_installed = True
+    except Exception:
+        demucs_installed = False
     print(json.dumps({
         "installed": True,
         "version": getattr(torch, "__version__", "unknown"),
         "cuda": bool(torch.cuda.is_available()),
+        "demucs": demucs_installed,
     }))
 except Exception:
-    print(json.dumps({"installed": False, "version": None, "cuda": False}))
+    print(json.dumps({"installed": False, "version": None, "cuda": False, "demucs": False}))
 """
     try:
         result = subprocess.run(
@@ -81,14 +87,15 @@ except Exception:
     except Exception:
         pass
 
-    return {"installed": False, "version": None, "cuda": False}
+    return {"installed": False, "version": None, "cuda": False, "demucs": False}
 
 
 def verify_pytorch_install(expect_cuda: bool) -> bool:
     verify_code = (
-        "import torch; "
+        "import torch; import demucs; "
         "print(f'PyTorch version: {torch.__version__}'); "
         "print(f'CUDA available: {torch.cuda.is_available()}'); "
+        "print('Demucs available: True'); "
         f"raise SystemExit(0 if torch.cuda.is_available() == {expect_cuda!r} else 2)"
     )
     result = subprocess.run([sys.executable, "-c", verify_code], creationflags=creation_flags())
@@ -157,6 +164,20 @@ def build_install_command(index_url: str, force_reinstall: bool = False) -> list
     if force_reinstall:
         cmd.append("--force-reinstall")
     return cmd
+
+
+def build_demucs_install_command() -> list[str]:
+    return [
+        sys.executable,
+        "-m",
+        "pip",
+        "install",
+        "demucs",
+        "--upgrade",
+        "--no-cache-dir",
+        "--progress-bar",
+        "off",
+    ]
 
 
 def run_pip_install(cmd: list[str]) -> int:
@@ -231,11 +252,11 @@ def install_pytorch() -> bool:
     current_status = get_pytorch_status()
     print(f"GPU Detection: {'NVIDIA GPU found' if has_nvidia else 'No NVIDIA GPU'}")
     if current_status["installed"]:
-        print(f"Current PyTorch: {current_status['version']} | CUDA: {current_status['cuda']}")
+        print(f"Current PyTorch: {current_status['version']} | CUDA: {current_status['cuda']} | Demucs: {current_status.get('demucs')}")
     print()
 
-    if current_status["installed"] and ((not has_nvidia) or current_status["cuda"]):
-        print("✓ Existing PyTorch is usable. No reinstall needed.")
+    if current_status["installed"] and current_status.get("demucs") and ((not has_nvidia) or current_status["cuda"]):
+        print("✓ Existing PyTorch and Demucs are usable. No reinstall needed.")
         update_config_files(True, current_status["cuda"])
         return True
 
@@ -293,12 +314,27 @@ def install_pytorch() -> bool:
         return False
 
     print()
-    print("Verifying installation...")
+    print("Installing Demucs AI vocal separation...")
+    demucs_returncode = run_pip_install(build_demucs_install_command())
+    if demucs_returncode != 0:
+        print()
+        print("=" * 60)
+        print("❌ Demucs installation failed!")
+        print("=" * 60)
+        print("Troubleshooting:")
+        print("  1. Check your internet connection")
+        print("  2. Upgrade pip: python -m pip install --upgrade pip")
+        print("  3. Try manual install: python -m pip install demucs --upgrade --no-cache-dir")
+        update_config_files(False, False)
+        return False
+
+    print()
+    print("Verifying PyTorch and Demucs installation...")
     verified = verify_pytorch_install(expect_cuda=expected_cuda)
     if not verified:
         print()
         print("=" * 60)
-        print("❌ PyTorch verification failed!")
+        print("❌ PyTorch/Demucs verification failed!")
         print("=" * 60)
         update_config_files(False, False)
         return False
@@ -306,10 +342,11 @@ def install_pytorch() -> bool:
     status = get_pytorch_status()
     print()
     print("=" * 60)
-    print("✅ PyTorch installation completed successfully!")
+    print("✅ PyTorch and Demucs installation completed successfully!")
     print("=" * 60)
     print(f"PyTorch: {status['version']}")
     print(f"CUDA available: {status['cuda']}")
+    print(f"Demucs available: {status.get('demucs')}")
     update_config_files(True, status["cuda"])
     print()
     print("Restart SRT Drama Tool to use PyTorch features.")

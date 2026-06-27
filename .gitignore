@@ -15,6 +15,7 @@ installer_output/
 logs/
 Output/
 rvc_models/
+Sound Effect/
 
 *.log
 crash_log.txt

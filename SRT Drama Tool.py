@@ -1,6 +1,6 @@
 ﻿# -*- coding: utf-8 -*-
 """
-SRT Drama Tool v1.1.4
+SRT Drama Tool v1.1.5
 PART 1 - Core UI + Light Accent Theme
 Author: NOU SARAT
 """
@@ -67,6 +67,9 @@ NATURAL_TIMING_VIDEO_MIN_SPEED = 0.70
 LONG_AUDIO_WARN_RATIO = 1.30
 EDGE_TTS_NATURAL_RATE_BOOST = 8
 VOXCPM2_NATURAL_SPEED = 1.00
+VOCAL_BACKGROUND_MUSIC_EFFECT = "music_effect"
+VOCAL_BACKGROUND_MUSIC_ONLY = "music"
+VOCAL_BACKGROUND_EFFECT_ONLY = "effect"
 
 try:
     from test_gpu import detect_gpu
@@ -161,7 +164,7 @@ def get_app_version():
         pass
     
     # Fallback to hardcoded version
-    return "1.1.4"
+    return "1.1.5"
 
 APP_VERSION = get_app_version()
 APP_NAME = "SRT Drama Tool"
@@ -2049,6 +2052,8 @@ class MainWindow(QMainWindow):
         self.gemini_progress_stage_signal.connect(self._set_gemini_progress_stage)
         self.stop_event = threading.Event()
         self.gemini_stop_event = threading.Event()
+        self._render_in_progress = False
+        self._render_playback_notice_shown = False
         self.last_generated_audio = None # ចងចាំ File អូឌីយ៉ូចុងក្រោយ
         self.generated_audio_segments = {}
         try:
@@ -3259,6 +3264,8 @@ class MainWindow(QMainWindow):
             self.media_player.pause()
 
     def play_video(self):
+        if self._block_playback_during_render():
+            return
         if self.media_player.state() == MEDIA_PLAYER_PLAYING:
             self.media_player.pause()
             self._stop_preview_audio()
@@ -3284,6 +3291,35 @@ class MainWindow(QMainWindow):
         self._dub_mix_path = ""
         self._stop_preview_audio()
 
+    def _is_render_in_progress(self) -> bool:
+        return bool(getattr(self, "_render_in_progress", False))
+
+    def _set_render_in_progress(self, active: bool) -> None:
+        self._render_in_progress = bool(active)
+        if active:
+            self._render_playback_notice_shown = False
+            self._disable_generated_dub_preview()
+            try:
+                self.force_stop_player()
+            except Exception:
+                pass
+            if hasattr(self, "play_btn"):
+                self.play_btn.setEnabled(False)
+                self.play_btn.setToolTip("Playback is paused while rendering to avoid audio/video file conflicts.")
+        else:
+            self._render_playback_notice_shown = False
+            if hasattr(self, "play_btn"):
+                self.play_btn.setToolTip("Play/Pause generated dub preview when available. Shortcut: Space")
+                self.play_btn.setEnabled(bool(getattr(self, "_video_ready", False)))
+
+    def _block_playback_during_render(self) -> bool:
+        if not self._is_render_in_progress():
+            return False
+        if not getattr(self, "_render_playback_notice_shown", False):
+            self.log("⏳ Playback is paused while video render is running. Please wait or press Stop Render first.")
+            self._render_playback_notice_shown = True
+        return True
+
     def _set_original_audio_muted_ui(self, muted: bool) -> None:
         self.original_audio_muted = muted
         self.media_player.setMuted(muted)
@@ -3301,6 +3337,8 @@ class MainWindow(QMainWindow):
         return False
 
     def play_generated_audio_row(self, row: int) -> None:
+        if self._block_playback_during_render():
+            return
         audio_info = getattr(self, "generated_audio_segments", {}).get(row, {})
         path = str(audio_info.get("path", "") or "")
         if not path or not os.path.exists(path):
@@ -3314,6 +3352,8 @@ class MainWindow(QMainWindow):
         self.play_audio_signal.emit(os.path.abspath(path), start_ms)
 
     def _start_generated_dub_preview(self) -> None:
+        if self._block_playback_during_render():
+            return
         self._dub_playback_enabled = True
         self._dub_current_row = "__mixed__"
         self._dub_mix_started = False
@@ -3380,6 +3420,8 @@ class MainWindow(QMainWindow):
         self._dub_mix_started = False
 
     def _sync_generated_dub_audio(self, position_ms: int) -> None:
+        if self._is_render_in_progress():
+            return
         if not getattr(self, "_allow_generated_dub_preview", True):
             return
         if not getattr(self, "_dub_playback_enabled", False):
@@ -3458,10 +3500,12 @@ class MainWindow(QMainWindow):
     def media_status_changed(self, status):
         if status in (QMediaPlayer.LoadedMedia, QMediaPlayer.BufferedMedia):
             self._video_ready = True
-            self.play_btn.setEnabled(True)
+            self.play_btn.setEnabled(not self._is_render_in_progress())
             if self._pending_segment_seek is not None:
                 seek_pos, end_pos = self._pending_segment_seek
                 self._pending_segment_seek = None
+                if self._block_playback_during_render():
+                    return
                 self.segment_end_time = self._qt_int_ms(end_pos, "segment end")
                 self.media_player.setPosition(self._qt_int_ms(seek_pos, "segment seek"))
                 self.media_player.play()
@@ -3469,6 +3513,8 @@ class MainWindow(QMainWindow):
                 return
             if self._pending_play_on_ready:
                 self._pending_play_on_ready = False
+                if self._block_playback_during_render():
+                    return
                 self.media_player.play()
                 self.segment_end_time = -1
             self.log("✅ Video ready")
@@ -4469,6 +4515,52 @@ class MainWindow(QMainWindow):
         except Exception:
             return os.path.join(os.path.expanduser("~"), ".srt_drama_generated_audio.json")
 
+    def _current_cache_source_id(self) -> str:
+        source_path = str(getattr(self, "current_srt_path", "") or getattr(self, "current_project_path", "") or "")
+        if source_path:
+            try:
+                return os.path.normcase(os.path.abspath(source_path))
+            except Exception:
+                return source_path
+        return ""
+
+    def _generated_clip_fingerprint_from_values(
+        self,
+        row: int,
+        start_ms: int,
+        end_ms: int,
+        text: str,
+        role: str = "",
+        voice: str = "",
+        rate: str = "",
+        pitch: str = "",
+    ) -> str:
+        payload = {
+            "source": self._current_cache_source_id(),
+            "row": int(row),
+            "start": int(start_ms),
+            "end": int(end_ms),
+            "text": str(text or "").strip(),
+            "role": str(role or "").strip(),
+            "voice": str(voice or "").strip(),
+            "rate": str(rate or "").strip(),
+            "pitch": str(pitch or "").strip(),
+        }
+        raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def _generated_clip_fingerprint_for_segment(self, segment: dict[str, Any]) -> str:
+        return self._generated_clip_fingerprint_from_values(
+            row=int(segment.get("_row", -1)),
+            start_ms=int(segment.get("start", 0) or 0),
+            end_ms=int(segment.get("end", 0) or 0),
+            text=str(segment.get("text", "") or ""),
+            role=str(segment.get("role", "") or ""),
+            voice=str(segment.get("voice", "") or ""),
+            rate=str(segment.get("rate", "") or ""),
+            pitch=str(segment.get("pitch", "") or ""),
+        )
+
     def _save_generated_audio_cache(self) -> None:
         try:
             cache_path = self._generated_audio_cache_file()
@@ -4478,7 +4570,8 @@ class MainWindow(QMainWindow):
             for k, v in (getattr(self, "generated_audio_segments", {}) or {}).items():
                 try:
                     path = str(v.get("path", "") or "")
-                    if path and os.path.exists(path):
+                    fingerprint = str(v.get("fingerprint", "") or "")
+                    if path and fingerprint and os.path.exists(path):
                         safe_map[int(k)] = {
                             "duration": int(v.get("duration", 0) or 0),
                             "start": int(v.get("start", 0) or 0),
@@ -4487,6 +4580,11 @@ class MainWindow(QMainWindow):
                             "path": path,
                             "fit_audio": bool(v.get("fit_audio", False)),
                             "source": str(v.get("source", "") or ""),
+                            "role": str(v.get("role", "") or ""),
+                            "voice": str(v.get("voice", "") or ""),
+                            "rate": str(v.get("rate", "") or ""),
+                            "pitch": str(v.get("pitch", "") or ""),
+                            "fingerprint": str(v.get("fingerprint", "") or ""),
                         }
                 except Exception:
                     continue
@@ -4507,7 +4605,8 @@ class MainWindow(QMainWindow):
                 try:
                     key = int(k)
                     path = str(v.get("path", "") or "")
-                    if path and os.path.exists(path):
+                    fingerprint = str(v.get("fingerprint", "") or "")
+                    if path and fingerprint and os.path.exists(path):
                         cleaned[key] = v
                 except Exception:
                     continue
@@ -5539,7 +5638,7 @@ class MainWindow(QMainWindow):
         # type: ignore
         self.slider_orig_vol = QSlider(QT_HORIZONTAL)  # type: ignore
         self.slider_orig_vol.setRange(0, 100)
-        self.slider_orig_vol.setValue(self.app_settings.get("orig_vol", 100))
+        self.slider_orig_vol.setValue(self.app_settings.get("orig_vol", 0))
         self.slider_orig_vol.setStyleSheet("""
             QSlider::groove:horizontal {
                 border: 1px solid #999;
@@ -5576,6 +5675,31 @@ class MainWindow(QMainWindow):
         self.chk_remove_vocals.setFont(QFont("Segoe UI", 10))
         self.chk_remove_vocals.setToolTip("Use Demucs AI to separate vocals from the original audio before mixing with generated TTS. Falls back to center-channel cancellation if Demucs is unavailable.")
         audio_opts_layout.addWidget(self.chk_remove_vocals)
+
+        vocal_bg_row = QHBoxLayout()
+        vocal_bg_row.addWidget(QLabel("After removing vocals keep:"))
+        self.cb_vocal_background_mode = QComboBox()
+        self.cb_vocal_background_mode.addItem("Music + Sound Effect", VOCAL_BACKGROUND_MUSIC_EFFECT)
+        self.cb_vocal_background_mode.addItem("Music Only", VOCAL_BACKGROUND_MUSIC_ONLY)
+        self.cb_vocal_background_mode.addItem("Sound Effect Only", VOCAL_BACKGROUND_EFFECT_ONLY)
+        saved_vocal_bg_mode = str(getattr(self, "app_settings", {}).get("vocal_background_mode", VOCAL_BACKGROUND_MUSIC_EFFECT))
+        saved_vocal_bg_index = self.cb_vocal_background_mode.findData(saved_vocal_bg_mode)
+        self.cb_vocal_background_mode.setCurrentIndex(max(0, saved_vocal_bg_index))
+        self.cb_vocal_background_mode.setEnabled(self.chk_remove_vocals.isChecked())
+        self.cb_vocal_background_mode.setToolTip(
+            "Choose the background track after vocal removal. Music Only and Sound Effect Only use Demucs 6-stem AI estimates."
+        )
+        vocal_bg_row.addWidget(self.cb_vocal_background_mode)
+        audio_opts_layout.addLayout(vocal_bg_row)
+
+        def _on_vocal_background_change(*_args) -> None:
+            self.cb_vocal_background_mode.setEnabled(self.chk_remove_vocals.isChecked())
+            self.app_settings["remove_vocals"] = self.chk_remove_vocals.isChecked()
+            self.app_settings["vocal_background_mode"] = self.cb_vocal_background_mode.currentData()
+            self.save_app_settings()
+
+        self.chk_remove_vocals.toggled.connect(_on_vocal_background_change)
+        self.cb_vocal_background_mode.currentIndexChanged.connect(_on_vocal_background_change)
 
         # Export buttons # type: ignore
         export_layout = QHBoxLayout()
@@ -6163,12 +6287,12 @@ class MainWindow(QMainWindow):
         layout.addWidget(ffmpeg_group)
 
         # PyTorch Section
-        pytorch_group = QGroupBox("PyTorch (GPU Acceleration for RVC Voice Conversion)")
+        pytorch_group = QGroupBox("PyTorch / Demucs AI (GPU Acceleration and Vocal Removal)")
         pytorch_group.setFont(QFont("Segoe UI", 11, QFont.Bold))
         pytorch_layout = QVBoxLayout()
 
         # Description
-        pytorch_desc = QLabel("Optional: Install PyTorch with GPU support for faster voice conversion using RVC. Auto-detects NVIDIA GPU.")
+        pytorch_desc = QLabel("Optional: Install PyTorch with GPU support plus Demucs AI for vocal removal. Auto-detects NVIDIA GPU.")
         pytorch_desc.setWordWrap(True)
         pytorch_desc.setStyleSheet("color: #6c757d; font-size: 9pt; padding: 5px;")
         pytorch_layout.addWidget(pytorch_desc)
@@ -6182,7 +6306,7 @@ class MainWindow(QMainWindow):
         pytorch_layout.addWidget(self.lbl_pytorch_status)
 
         # Install button # type: ignore
-        btn_pytorch = QPushButton("⬇️ Install PyTorch (with GPU Support)")
+        btn_pytorch = QPushButton("⬇️ Install PyTorch / Demucs AI")
         btn_pytorch.setFixedHeight(50)
         btn_pytorch.clicked.connect(self.install_pytorch_auto)
         btn_pytorch.setCursor(Qt.PointingHandCursor)  # type: ignore[attr-defined]
@@ -10469,10 +10593,16 @@ class MainWindow(QMainWindow):
 import json
 try:
     import torch
+    try:
+        import demucs
+        demucs_installed = True
+    except Exception:
+        demucs_installed = False
     data = {
         "installed": True,
         "version": getattr(torch, "__version__", "unknown"),
         "cuda": bool(torch.cuda.is_available()),
+        "demucs": demucs_installed,
     }
     data["gpu_name"] = torch.cuda.get_device_name(0) if data["cuda"] else None
     print(json.dumps(data))
@@ -10509,9 +10639,11 @@ except Exception:
                 status_text += f" (GPU: {gpu_name})" if gpu_name else " (GPU enabled)"
             else:
                 status_text += " (CPU mode)"
+            if not status.get("demucs"):
+                status_text += " | Demucs missing"
             return {
                 "text": status_text,
-                "color": "#28a745"
+                "color": "#28a745" if status.get("demucs") else "#ffc107"
             }
         except (ImportError, AttributeError): # AttributeError for torch.cuda.is_available if torch is not fully installed # type: ignore
             return {
@@ -11100,6 +11232,24 @@ except Exception:
         if importlib.util.find_spec("demucs") is not None:
             return [sys.executable, "-m", "demucs"]
 
+        python_cmd = self._python_command()
+        if python_cmd:
+            try:
+                result = subprocess.run(
+                    [*python_cmd, "-c", "import demucs, torch"],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=30,
+                    creationflags=self._subprocess_creation_flags(),
+                    env=external_process_env(),
+                )
+                if result.returncode == 0:
+                    return [*python_cmd, "-m", "demucs"]
+            except Exception:
+                pass
+
         return None
 
     def _release_cuda_memory(self, log_release: bool = False) -> None:
@@ -11124,7 +11274,15 @@ except Exception:
         except Exception:
             pass
 
-    def _run_demucs_in_process(self, source_wav: str, separated_dir: str) -> bool:
+    def _demucs_background_label(self, background_mode: str) -> str:
+        labels = {
+            VOCAL_BACKGROUND_MUSIC_EFFECT: "music + sound effects",
+            VOCAL_BACKGROUND_MUSIC_ONLY: "music only",
+            VOCAL_BACKGROUND_EFFECT_ONLY: "sound effects only",
+        }
+        return labels.get(background_mode, labels[VOCAL_BACKGROUND_MUSIC_EFFECT])
+
+    def _run_demucs_in_process(self, source_wav: str, separated_dir: str, background_mode: str) -> bool:
         try:
             from demucs.separate import main as demucs_main  # type: ignore
             import demucs.audio as demucs_audio  # type: ignore
@@ -11155,6 +11313,8 @@ except Exception:
         demucs_separate.save_audio = save_wav_without_torchcodec
 
         demucs_device = "cuda" if torch.cuda.is_available() else "cpu"
+        demucs_label = self._demucs_background_label(background_mode)
+        demucs_model = "htdemucs" if background_mode == VOCAL_BACKGROUND_MUSIC_EFFECT else "htdemucs_6s"
         if demucs_device == "cuda":
             try:
                 self.log(f"🤖 Removing vocals with bundled Demucs AI on GPU: {torch.cuda.get_device_name(0)}")
@@ -11162,7 +11322,10 @@ except Exception:
                 self.log("🤖 Removing vocals with bundled Demucs AI on GPU")
         else:
             self.log("🤖 Removing vocals with bundled Demucs AI on CPU. This can take a while.")
-        self.progress_text_signal.emit("Demucs: removing vocals")
+        self.log(f"🎚️ Demucs background mode: {demucs_label}")
+        if demucs_model == "htdemucs_6s":
+            self.log("ℹ️ Music Only / Sound Effect Only uses Demucs 6-stem separation, so it can take longer.")
+        self.progress_text_signal.emit(f"Demucs: {demucs_label}")
         heartbeat_stop = threading.Event()
 
         def demucs_heartbeat() -> None:
@@ -11171,7 +11334,7 @@ except Exception:
                 elapsed = int(time.monotonic() - started_at)
                 minutes, seconds = divmod(elapsed, 60)
                 self.log(f"⏳ Demucs still working... elapsed {minutes:02d}:{seconds:02d}")
-                self.progress_text_signal.emit(f"Demucs: removing vocals ({minutes:02d}:{seconds:02d})")
+                self.progress_text_signal.emit(f"Demucs: {demucs_label} ({minutes:02d}:{seconds:02d})")
 
         heartbeat_thread = threading.Thread(target=demucs_heartbeat, daemon=True)
         heartbeat_thread.start()
@@ -11179,18 +11342,19 @@ except Exception:
             import contextlib
             import io
             demucs_output = io.StringIO()
+            demucs_args = [
+                "-n",
+                demucs_model,
+                "-d",
+                demucs_device,
+                "-o",
+                separated_dir,
+                source_wav,
+            ]
+            if background_mode == VOCAL_BACKGROUND_MUSIC_EFFECT:
+                demucs_args = ["--two-stems", "vocals"] + demucs_args
             with contextlib.redirect_stdout(demucs_output), contextlib.redirect_stderr(demucs_output):
-                demucs_main([
-                    "--two-stems",
-                    "vocals",
-                    "-n",
-                    "htdemucs",
-                    "-d",
-                    demucs_device,
-                    "-o",
-                    separated_dir,
-                    source_wav,
-                ])
+                demucs_main(demucs_args)
             return True
         except Exception as e:
             self.log(f"⚠️ Demucs vocal removal failed: {e}")
@@ -11206,6 +11370,27 @@ except Exception:
             demucs_audio.save_audio = original_audio_save
             demucs_separate.save_audio = original_separate_save
             self._release_cuda_memory(log_release=True)
+
+    def _run_demucs_external(self, demucs_cmd: list[str], source_wav: str, separated_dir: str, background_mode: str) -> bool:
+        demucs_label = self._demucs_background_label(background_mode)
+        demucs_model = "htdemucs" if background_mode == VOCAL_BACKGROUND_MUSIC_EFFECT else "htdemucs_6s"
+        self.log(f"🤖 Removing vocals with external Demucs AI: {' '.join(demucs_cmd)}")
+        self.log(f"🎚️ Demucs background mode: {demucs_label}")
+        if demucs_model == "htdemucs_6s":
+            self.log("ℹ️ Music Only / Sound Effect Only uses Demucs 6-stem separation, so it can take longer.")
+
+        demucs_args = [
+            *demucs_cmd,
+            "-n",
+            demucs_model,
+            "-o",
+            separated_dir,
+            source_wav,
+        ]
+        if background_mode == VOCAL_BACKGROUND_MUSIC_EFFECT:
+            demucs_args = [*demucs_cmd, "--two-stems", "vocals", "-n", demucs_model, "-o", separated_dir, source_wav]
+
+        return self._run_process_for_demucs(demucs_args, "External Demucs vocal removal")
 
     def _run_process_for_demucs(self, cmd: list[str], step_name: str) -> bool:
         try:
@@ -11253,19 +11438,79 @@ except Exception:
             return False
         return True
 
-    def _create_demucs_no_vocals(
+    def _find_demucs_stem(self, separated_dir: str, stem_name: str) -> Optional[str]:
+        matches = glob.glob(os.path.join(separated_dir, "*", "*", f"{stem_name}.*"))
+        return matches[0] if matches else None
+
+    def _combine_demucs_stems(
+        self,
+        separated_dir: str,
+        stem_names: list[str],
+        output_file: str,
+        ffmpeg_bin: str,
+    ) -> Optional[str]:
+        stems = [path for name in stem_names if (path := self._find_demucs_stem(separated_dir, name))]
+        if not stems:
+            return None
+
+        self._configure_audio_converter(ffmpeg_bin)
+        loaded_stems = [self.safe_load_audio(path, ffmpeg_bin).set_channels(2) for path in stems]
+        target_rate = loaded_stems[0].frame_rate
+        max_len = max(len(stem) for stem in loaded_stems)
+        mix = AudioSegment.silent(duration=max_len, frame_rate=target_rate).set_channels(2)
+        for stem in loaded_stems:
+            mix = mix.overlay(stem.set_frame_rate(target_rate).set_channels(2))
+        try:
+            mix = effects.normalize(mix, headroom=1.0)
+        except Exception:
+            pass
+        mix.export(output_file, format="wav")
+        return output_file if os.path.exists(output_file) else None
+
+    def _select_demucs_background_track(
+        self,
+        separated_dir: str,
+        background_mode: str,
+        output_file: str,
+        ffmpeg_bin: str,
+    ) -> Optional[str]:
+        if background_mode == VOCAL_BACKGROUND_MUSIC_EFFECT:
+            no_vocals = self._find_demucs_stem(separated_dir, "no_vocals")
+            if no_vocals:
+                return no_vocals
+            return self._combine_demucs_stems(separated_dir, ["drums", "bass", "other", "guitar", "piano"], output_file, ffmpeg_bin)
+
+        if background_mode == VOCAL_BACKGROUND_MUSIC_ONLY:
+            music = self._combine_demucs_stems(separated_dir, ["drums", "bass", "guitar", "piano"], output_file, ffmpeg_bin)
+            if music:
+                return music
+            self.log("⚠️ Music-only stems were not found. Falling back to music + effects.")
+            return self._select_demucs_background_track(separated_dir, VOCAL_BACKGROUND_MUSIC_EFFECT, output_file, ffmpeg_bin)
+
+        if background_mode == VOCAL_BACKGROUND_EFFECT_ONLY:
+            effect = self._find_demucs_stem(separated_dir, "other")
+            if effect:
+                self.log("ℹ️ Sound Effect Only uses Demucs 'other' stem, which can also contain some instruments.")
+                return effect
+            self.log("⚠️ Sound-effect stem was not found. Falling back to music + effects.")
+            return self._select_demucs_background_track(separated_dir, VOCAL_BACKGROUND_MUSIC_EFFECT, output_file, ffmpeg_bin)
+
+        return self._select_demucs_background_track(separated_dir, VOCAL_BACKGROUND_MUSIC_EFFECT, output_file, ffmpeg_bin)
+
+    def _create_demucs_background_track(
         self,
         video_path: str,
         ffmpeg_bin: str,
         temp_export_files: list[str],
         temp_export_dirs: list[str],
+        background_mode: str,
         max_duration_ms: int = 0,
     ) -> Optional[str]:
         demucs_cmd = self._demucs_command()
         can_run_in_process = importlib.util.find_spec("demucs") is not None
-        if not can_run_in_process:
-            self.log("⚠️ Demucs is not installed in the Python environment used by this app. Falling back to approximate vocal reduction.")
-            self.log(f"💡 Install with this Python: {sys.executable} -m pip install demucs")
+        if not can_run_in_process and not demucs_cmd:
+            self.log("⚠️ Demucs is not installed. Falling back to approximate vocal reduction.")
+            self.log("💡 Open Settings → Required Software and run Install PyTorch / Demucs AI.")
             return None
 
         work_dir = tempfile.mkdtemp(prefix="srt_drama_demucs_")
@@ -11304,17 +11549,22 @@ except Exception:
             self.log(f"ℹ️ Demucs input length: {duration_min:.1f} min. CPU separation can take much longer than encoding.")
 
         if can_run_in_process:
-            if not self._run_demucs_in_process(source_wav, separated_dir):
+            if not self._run_demucs_in_process(source_wav, separated_dir, background_mode):
+                return None
+        elif demucs_cmd:
+            if not self._run_demucs_external(demucs_cmd, source_wav, separated_dir, background_mode):
                 return None
 
-        matches = glob.glob(os.path.join(separated_dir, "*", "*", "no_vocals.*"))
-        if not matches:
-            self.log("⚠️ Demucs finished but no no_vocals file was found. Falling back.")
+        background_file = os.path.join(work_dir, f"demucs_{background_mode}.wav")
+        selected_track = self._select_demucs_background_track(separated_dir, background_mode, background_file, ffmpeg_bin)
+        if not selected_track:
+            self.log("⚠️ Demucs finished but the requested background track was not found. Falling back.")
             return None
 
-        no_vocals = matches[0]
-        self.log(f"✅ Demucs no-vocals track ready: {os.path.basename(no_vocals)}")
-        return no_vocals
+        if selected_track == background_file:
+            temp_export_files.append(selected_track)
+        self.log(f"✅ Demucs background track ready ({self._demucs_background_label(background_mode)}): {os.path.basename(selected_track)}")
+        return selected_track
     
     def get_output_dir(self): # type: ignore
         path = ""
@@ -12184,6 +12434,7 @@ except Exception:
     def on_export_finished(self) -> None:
         if getattr(self, "merge_in_progress", False):
             return
+        self._set_render_in_progress(False)
         self.btn_export_mp4.setEnabled(True) # type: ignore
         self.btn_run_srt.setEnabled(True)
         self.btn_timeline_audio.setEnabled(True)
@@ -12249,6 +12500,8 @@ except Exception:
         return None
 
     def handle_play_video_button(self) -> None:
+        if self._block_playback_during_render():
+            return
         row = self.get_row_for_sender() # type: ignore
         if row is not None:
             audio_info = getattr(self, "generated_audio_segments", {}).get(row, {})
@@ -12563,6 +12816,25 @@ except Exception:
             else:
                 target_duration = max(target_duration, int(audio_duration))
         return max(100, target_duration - 50)
+
+    @staticmethod
+    def _voice_padding_ms(audio_duration: int) -> int:
+        """Use less guard silence for very short words so they do not sound detached."""
+        return max(10, min(50, int(audio_duration) // 10))
+
+    @staticmethod
+    def _apply_voice_fades(segment: AudioSegment, fade_in: int, fade_out: int) -> AudioSegment:
+        duration = len(segment)
+        if duration <= 0:
+            return segment
+        max_fade = max(0, min(75, duration // 8))
+        safe_fade_in = max(0, min(int(fade_in), max_fade))
+        safe_fade_out = max(0, min(int(fade_out), max_fade))
+        if safe_fade_in > 0:
+            segment = segment.fade_in(safe_fade_in)
+        if safe_fade_out > 0:
+            segment = segment.fade_out(safe_fade_out)
+        return segment
 
     def _next_segment_start_ms(self, row: int) -> Optional[int]:
         next_row = row + 1
@@ -13019,6 +13291,8 @@ except Exception:
             return 0
 
     def play_video_segment(self, row: int) -> None:
+        if self._block_playback_during_render():
+            return
         try:
             item_start = self.segment_table.item(row, 0)
             item_end = self.segment_table.item(row, 1)
@@ -13095,6 +13369,8 @@ except Exception:
 
     def on_play_audio(self, file_path, start_ms):
         """Play audio preview using pygame"""
+        if self._block_playback_during_render():
+            return
         if start_ms >= 0 and self.media_player.state() != MEDIA_PLAYER_PLAYING:
             self.media_player.setPosition(self._qt_int_ms(start_ms, "audio preview seek"))
             self.original_audio_muted = True
@@ -13256,14 +13532,11 @@ except Exception:
             c_fade_out = coerce_int(config.get("fade_out"), -1)
             final_fade_out = c_fade_out if c_fade_out != -1 else global_fade_out
         
-            if final_fade_in > 0:
-                final_segment = final_segment.fade_in(final_fade_in)
-            if final_fade_out > 0:
-                final_segment = final_segment.fade_out(final_fade_out)
+            final_segment = self._apply_voice_fades(final_segment, final_fade_in, final_fade_out)
         
         # type: ignore
             # Add padding to prevent abrupt starts/ends # type: ignore
-            pad_ms = 50
+            pad_ms = self._voice_padding_ms(len(final_segment))
             silence = AudioSegment.silent(duration=pad_ms, frame_rate=final_segment.frame_rate)
             final_segment = silence + final_segment + silence
 
@@ -13312,6 +13585,20 @@ except Exception:
                         "text": str(text or ""),
                         "path": os.path.abspath(output_file_path),
                         "fit_audio": bool(auto_fit_enabled),
+                        "role": str(role or ""),
+                        "voice": str(voice or ""),
+                        "rate": str(rate_str or ""),
+                        "pitch": str(pitch_str or ""),
+                        "fingerprint": self._generated_clip_fingerprint_from_values(
+                            row=int(row),
+                            start_ms=int(seg_start_ms),
+                            end_ms=int(seg_end_ms),
+                            text=str(text or ""),
+                            role=str(role or ""),
+                            voice=str(voice or ""),
+                            rate=str(rate_str or ""),
+                            pitch=str(pitch_str or ""),
+                        ),
                     }
                     self.generated_audio_segments = generated_audio_segments
                     try:
@@ -13796,12 +14083,9 @@ except Exception:
 
         if reverb:
             segment = self._apply_thought_reverb(segment)
-        if fade_in > 0:
-            segment = segment.fade_in(fade_in)
-        if fade_out > 0:
-            segment = segment.fade_out(fade_out)
+        segment = self._apply_voice_fades(segment, fade_in, fade_out)
 
-        pad_ms = 50
+        pad_ms = self._voice_padding_ms(len(segment))
         silence = AudioSegment.silent(duration=pad_ms, frame_rate=segment.frame_rate)
         segment = silence + segment + silence
         segment.export(output_file, format="wav")
@@ -13894,6 +14178,20 @@ except Exception:
                             "text": row_text,
                             "path": os.path.abspath(preview_path),
                             "fit_audio": bool(auto_fit),
+                            "role": str(role or ""),
+                            "voice": str(voice or ""),
+                            "rate": str(rate or ""),
+                            "pitch": str(pitch or ""),
+                            "fingerprint": self._generated_clip_fingerprint_from_values(
+                                row=int(row),
+                                start_ms=int(start_ms),
+                                end_ms=int(end_ms),
+                                text=row_text,
+                                role=str(role or ""),
+                                voice=str(voice or ""),
+                                rate=str(rate or ""),
+                                pitch=str(pitch or ""),
+                            ),
                         }
                         self.generated_audio_segments = generated_audio_segments
                         try:
@@ -14014,6 +14312,20 @@ except Exception:
                                 "text": row_text,
                                 "path": os.path.abspath(preview_path),
                                 "fit_audio": bool(auto_fit),
+                                "role": str(role or ""),
+                                "voice": str(voice or ""),
+                                "rate": str(rate or ""),
+                                "pitch": str(pitch or ""),
+                                "fingerprint": self._generated_clip_fingerprint_from_values(
+                                    row=int(row),
+                                    start_ms=int(start_ms),
+                                    end_ms=int(end_ms),
+                                    text=row_text,
+                                    role=str(role or ""),
+                                    voice=str(voice or ""),
+                                    rate=str(rate or ""),
+                                    pitch=str(pitch or ""),
+                                ),
                             }
                             self.generated_audio_segments = generated_audio_segments
                             self.audio_status_signal.emit(int(row), status_text, status_state)
@@ -14535,13 +14847,10 @@ except Exception:
                         seg_fade_out = seg_info.get('fade_out', fade_out) if seg_info else fade_out # type: ignore
                     
                         # Apply Fades FIRST (Fade លើសំឡេងជាមុនសិន)
-                        if seg_fade_in > 0:
-                            segment = segment.fade_in(seg_fade_in)
-                        if seg_fade_out > 0:
-                            segment = segment.fade_out(seg_fade_out)
+                        segment = self._apply_voice_fades(segment, seg_fade_in, seg_fade_out)
 
                         # THEN Add fixed silence padding (បន្ទាប់មកទើបបន្ថែម Silence ការពារដាច់)
-                        pad_ms = 50
+                        pad_ms = self._voice_padding_ms(len(segment))
                         silence = AudioSegment.silent(duration=pad_ms, frame_rate=segment.frame_rate)
                         segment = silence + segment + silence
 
@@ -14609,6 +14918,16 @@ except Exception:
                                 "text": str(seg_info.get("text", "")) if seg_info else "",
                                 "path": clip_path,
                                 "fit_audio": bool(auto_fit),
+                                "role": str(seg_info.get("role", "")) if seg_info else "",
+                                "voice": str(seg_info.get("voice", "")) if seg_info else "",
+                                "rate": str(seg_info.get("rate", "")) if seg_info else "",
+                                "pitch": str(seg_info.get("pitch", "")) if seg_info else "",
+                                "fingerprint": self._generated_clip_fingerprint_for_segment(seg_info) if seg_info else self._generated_clip_fingerprint_from_values(
+                                    row=int(row),
+                                    start_ms=int(start_ms),
+                                    end_ms=int(start_ms + len(segment)),
+                                    text="",
+                                ),
                             }
                             if not clip_path:
                                 self.log(f"⚠️ Row {int(row) + 1} has generated audio but no preview clip path.")
@@ -14910,13 +15229,10 @@ except Exception:
                 audio = self.safe_load_audio(temp_file, ffmpeg_bin)
 
                 # Apply Fades FIRST
-                if fade_in > 0:
-                    audio = audio.fade_in(fade_in)
-                if fade_out > 0:
-                    audio = audio.fade_out(fade_out)
+                audio = self._apply_voice_fades(audio, fade_in, fade_out)
         
                 # THEN Add fixed silence padding # type: ignore
-                pad_ms = 50 # type: ignore
+                pad_ms = self._voice_padding_ms(len(audio)) # type: ignore
                 silence = AudioSegment.silent(duration=pad_ms, frame_rate=audio.frame_rate)
                 audio = silence + audio + silence
         
@@ -14954,13 +15270,10 @@ except Exception:
             audio = self.safe_load_audio(filepath, ffmpeg_bin)
 
             # Apply Fades FIRST
-            if fade_in > 0:
-                audio = audio.fade_in(fade_in)
-            if fade_out > 0:
-                audio = audio.fade_out(fade_out)
+            audio = self._apply_voice_fades(audio, fade_in, fade_out)
 
             # THEN Add fixed silence padding
-            pad_ms = 50
+            pad_ms = self._voice_padding_ms(len(audio))
             silence = AudioSegment.silent(duration=pad_ms, frame_rate=audio.frame_rate)
             audio = silence + audio + silence
 
@@ -15533,6 +15846,10 @@ except Exception:
         if row is None:
             return ""
         audio_info = getattr(self, "generated_audio_segments", {}).get(int(row), {})
+        cached_fingerprint = str(audio_info.get("fingerprint", "") or "")
+        expected_fingerprint = self._generated_clip_fingerprint_for_segment(segment)
+        if not cached_fingerprint or cached_fingerprint != expected_fingerprint:
+            return ""
         if require_natural and audio_info.get("fit_audio", None) is not False:
             return ""
         expected_start = int(segment.get("start", 0) or 0)
@@ -16384,6 +16701,7 @@ except Exception:
 
         mode_str = "Preview" if preview else "Export"
         self.log(f"🎬 Starting Professional Video {mode_str}...")
+        self._set_render_in_progress(True)
         self.btn_export_mp4.setEnabled(False)
         self.stop_marquee_preview()
 
@@ -16434,6 +16752,7 @@ except Exception:
             "auto_play": self.chk_autoplay.isChecked(), # បញ្ជូនតម្លៃ Auto Play ទៅ Thread
             "use_gpu": self.chk_gpu.isChecked(),
             "remove_vocals": self.chk_remove_vocals.isChecked(),
+            "vocal_background_mode": self.cb_vocal_background_mode.currentData() if hasattr(self, "cb_vocal_background_mode") else VOCAL_BACKGROUND_MUSIC_EFFECT,
             "enable_lip_sync": self.chk_lip_sync.isChecked() if hasattr(self, 'chk_lip_sync') else False,
             "ad_video_path": "" if preview else self._next_ad_video_path(),
             "ad_video_position": self.get_ad_video_position(),
@@ -16444,6 +16763,7 @@ except Exception:
         settings.update(marquee_settings)
 
         self.app_settings["remove_vocals"] = self.chk_remove_vocals.isChecked() # type: ignore
+        self.app_settings["vocal_background_mode"] = settings["vocal_background_mode"]
         self.app_settings["crop_values"] = [crop_top, crop_bottom, crop_left, crop_right]
         self.app_settings["crop_zoom_percent"] = settings["crop_zoom"]
         self.app_settings["marquee_enabled"] = settings["marquee_enabled"]
@@ -16469,6 +16789,7 @@ except Exception:
             segments = self.get_active_segments()
             if not segments:
                 QMessageBox.warning(self, "Warning", "No segments found to export!")
+                self._set_render_in_progress(False)
                 self.btn_export_mp4.setEnabled(True)
                 return
 
@@ -16612,14 +16933,19 @@ except Exception:
     
             # Audio Mixing: [0:a] original/video audio + [1:a] generated TTS -> [a_out]
             vol = s['orig_vol']
-            self.log(f"🔊 Audio mix: original={int(vol * 100)}%, TTS=100%, remove_vocals={'on' if s.get('remove_vocals', False) else 'off'}")
+            vocal_background_mode = str(s.get("vocal_background_mode", VOCAL_BACKGROUND_MUSIC_EFFECT) or VOCAL_BACKGROUND_MUSIC_EFFECT)
+            if vocal_background_mode not in {VOCAL_BACKGROUND_MUSIC_EFFECT, VOCAL_BACKGROUND_MUSIC_ONLY, VOCAL_BACKGROUND_EFFECT_ONLY}:
+                vocal_background_mode = VOCAL_BACKGROUND_MUSIC_EFFECT
+            vocal_mode_label = self._demucs_background_label(vocal_background_mode)
+            remove_vocals_label = vocal_mode_label if s.get('remove_vocals', False) else "off"
+            self.log(f"🔊 Audio mix: original={int(vol * 100)}%, TTS=100%, remove_vocals={remove_vocals_label}")
     
             # Check for audio stream before trying to map [0:a]
             has_audio = self.has_audio_stream(video_path)
             if not has_audio and vol > 0:
                 self.log(f"⚠️ Warning: Input video has no audio stream. Ignoring 'Original Audio Vol'.")
 
-            demucs_no_vocals = None
+            demucs_background_track = None
             if vol > 0 and has_audio and s.get('remove_vocals', False):
                 demucs_limit_ms = 0
                 try:
@@ -16628,13 +16954,20 @@ except Exception:
                         demucs_limit_ms = len(AudioSegment.from_file(tts_audio))
                 except Exception:
                     demucs_limit_ms = 0
-                demucs_no_vocals = self._create_demucs_no_vocals(video_path, ffmpeg_bin, temp_export_files, temp_export_dirs, demucs_limit_ms)
-                if demucs_no_vocals:
-                    cmd.extend(["-i", demucs_no_vocals])
+                demucs_background_track = self._create_demucs_background_track(
+                    video_path,
+                    ffmpeg_bin,
+                    temp_export_files,
+                    temp_export_dirs,
+                    vocal_background_mode,
+                    demucs_limit_ms,
+                )
+                if demucs_background_track:
+                    cmd.extend(["-i", demucs_background_track])
 
             if vol > 0 and has_audio:
                 if s.get('remove_vocals', False):
-                    if demucs_no_vocals:
+                    if demucs_background_track:
                         bg_vol = vol * 2
                         self.log(f"🎚️ Demucs background volume boost: {bg_vol:.2f}x")
                         fc.append(f"[2:a]volume={bg_vol},alimiter=limit=0.95[a0];[1:a]volume=1.0[a1];[a0][a1]amix=inputs=2:duration=longest:normalize=0[a_mix];[a_mix]asetpts=PTS-STARTPTS[a_out]")
@@ -17027,6 +17360,7 @@ except Exception:
         ffmpeg_bin = self.get_ffmpeg()
         imported = 0
         skipped = 0
+        current_segments_by_row = {int(seg.get("_row", -1)): seg for seg in self.get_segments_from_table()}
         generated_audio_segments = dict(getattr(self, "generated_audio_segments", {}) or {})
         for row_number, path in sorted(found.items()):
             row_index = row_number - 1
@@ -17048,6 +17382,7 @@ except Exception:
             start_ms = int(item_start.data(QT_USER_ROLE) or 0)
             end_ms = int(item_end.data(QT_USER_ROLE) or start_ms)
             text = item_text.text() if item_text else ""
+            segment = current_segments_by_row.get(row_index, {})
             generated_audio_segments[row_index] = {
                 "duration": duration,
                 "start": start_ms,
@@ -17056,6 +17391,16 @@ except Exception:
                 "path": os.path.abspath(path),
                 "fit_audio": False,
                 "source": "voxcpm2_web",
+                "role": str(segment.get("role", "") or ""),
+                "voice": str(segment.get("voice", "") or ""),
+                "rate": str(segment.get("rate", "") or ""),
+                "pitch": str(segment.get("pitch", "") or ""),
+                "fingerprint": self._generated_clip_fingerprint_for_segment(segment) if segment else self._generated_clip_fingerprint_from_values(
+                    row=row_index,
+                    start_ms=start_ms,
+                    end_ms=end_ms,
+                    text=str(text or ""),
+                ),
             }
             status_text, status_state, _ratio = self._audio_timing_status(duration, start_ms, end_ms)
             self.set_row_audio_status(row_index, status_text if status_text != "Done" else "Vox OK", status_state)
@@ -17830,7 +18175,7 @@ except Exception:
                     'use_gpu': use_gpu,
                     'preset': 'veryfast',
                     'crf': 23,
-                    'orig_vol': 0.5,
+                    'orig_vol': 0.0,
                     'remove_vocals': False,
                     'preview': False,
                     'cut_enabled': False

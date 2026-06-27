@@ -25,11 +25,11 @@ datas = [
     ('splash_logo.png', '.'),
 ]
 
-for package_name in ('demucs', 'dora', 'omegaconf', 'openunmix', 'julius'):
+for package_name in ('demucs', 'dora', 'omegaconf', 'openunmix', 'julius', 'numpy'):
     datas += collect_data_files(package_name)
 
 binaries = []
-for package_name in ('torchaudio', 'torch'):
+for package_name in ('torchaudio', 'torch', 'numpy'):
     binaries += collect_dynamic_libs(package_name)
 
 hiddenimports = [
@@ -54,6 +54,12 @@ hiddenimports = [
     'einops',
     'dora',
     'omegaconf',
+    'numpy',
+    'numpy.core',
+    'numpy.core.multiarray',
+    'numpy._core',
+    'numpy._core.multiarray',
+    'numpy._core._multiarray_umath',
     # asyncio is stdlib - do NOT add to hiddenimports (causes circular import)
 ]
 
@@ -66,7 +72,7 @@ a = Analysis(
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
-    hookspath=[],
+    hookspath=['pyinstaller_hooks'],
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
